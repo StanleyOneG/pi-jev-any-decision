@@ -73,6 +73,7 @@ export function createDelegationAssessment(ask: (input: AssessmentInput, signal:
     let requestPreparedForRun = false;
     let directActionGeneration: number | undefined;
     let budgetWarningKey: string | undefined;
+    let assessmentWarningKey: string | undefined;
     const cache = new Map<string, Assessment>();
     const inFlight = new Map<string, Promise<Assessment>>();
     const failOpen = (ctx: ExtensionContext): void => {
@@ -232,7 +233,11 @@ export function createDelegationAssessment(ask: (input: AssessmentInput, signal:
       if (gate.state.disabled) return;
       const verdict = gate.mayWork(config.mode, tokens, config.contextGrowthTokens, launch);
       const need = gate.assessmentNeed(tokens, config.contextGrowthTokens);
-      if (config.mode === "observe" && need) {
+      // Token counts and tool IDs change while the same assessment remains stale.
+      // Generation changes on a new request, phase, session, or invalidation.
+      const warningKey = `${gate.state.generation}:${need}`;
+      if (config.mode === "observe" && need && assessmentWarningKey !== warningKey) {
+        assessmentWarningKey = warningKey;
         const reason = need === "context_growth"
           ? `оценка устарела: рост контекста на ${tokens! - gate.state.assessment!.contextTokens!} токенов, порог ${config.contextGrowthTokens}; повторите delegation_assess с phase=context_growth и новым phaseId перед следующим рабочим инструментом`
           : need === "pending" ? "оценка ещё выполняется" : "оценка отсутствует для текущего запроса или фазы; вызовите delegation_assess";

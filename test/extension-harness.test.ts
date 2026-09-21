@@ -31,6 +31,53 @@ test("observe distinguishes missing assessment from growth expiry and provides r
   assert.match(injected, /before the next working tool, including subagent launches/);
 });
 
+test("observe warns once per stale assessment across tool batches and further growth", async () => {
+  const h = await harness("observe"); createDelegationAssessment(async () => direct)(h.pi); await start(h);
+  const assess = (phaseId: string) => tool(h, "delegation_assess").execute("a", input(phaseId), undefined, undefined, h.ctx);
+  let callId = 0;
+  const work = (toolName = "read") => h.handlers.get("tool_call")![0]({ toolName, toolCallId: `work-${callId++}`, input: {} }, h.ctx);
+  const warnings = () => h.notices.filter((text) => text.startsWith("Наблюдение:"));
+  await assess("initial");
+  h.setTokens(16_010);
+  assert.equal(await work(), undefined);
+  assert.equal(warnings().length, 1);
+  assert.match(warnings()[0], /оценка устарела.*context_growth/);
+  assert.deepEqual(await Promise.all(Array.from({ length: 8 }, () => work())), Array(8).fill(undefined));
+  h.setTokens(33_354); assert.equal(await work("bash"), undefined);
+  h.setTokens(undefined); await work();
+  h.setTokens(34_000); await work();
+  assert.equal(warnings().length, 1, "same stale assessment must not spam, even as token counts change");
+  await assess("fresh-growth"); await work();
+  assert.equal(warnings().length, 1);
+  h.setTokens(50_000); await work(); await work();
+  assert.equal(warnings().length, 2, "a newly expired assessment gets its own warning");
+});
+
+test("observe deduplicates missing and pending warnings but rearms on lifecycle changes", async () => {
+  const h = await harness("observe");
+  let resolve!: (value: ModelJudgment) => void;
+  createDelegationAssessment(() => new Promise((done) => { resolve = done; }))(h.pi); await start(h);
+  const work = () => h.handlers.get("tool_call")![0]({ toolName: "read", toolCallId: "r", input: {} }, h.ctx);
+  const warnings = () => h.notices.filter((text) => text.startsWith("Наблюдение:"));
+  await work(); await work();
+  assert.equal(warnings().length, 1);
+  assert.match(warnings().at(-1)!, /оценка отсутствует/);
+  const pending = tool(h, "delegation_assess").execute("a", input(), undefined, undefined, h.ctx);
+  await work(); await work();
+  assert.equal(warnings().length, 2);
+  assert.match(warnings().at(-1)!, /ещё выполняется/);
+  resolve(direct); await pending;
+  h.setTokens(16_010); await work(); await work();
+  assert.equal(warnings().length, 3, "pending warning must not hide expiry in the same generation");
+  assert.match(warnings().at(-1)!, /оценка устарела/);
+  h.handlers.get("input")![0]({ source: "interactive", text: "next request" }, h.ctx);
+  await work(); await work(); assert.equal(warnings().length, 4);
+  h.handlers.get("session_tree")![0]({}, h.ctx);
+  await work(); await work(); assert.equal(warnings().length, 5);
+  await start(h);
+  await work(); await work(); assert.equal(warnings().length, 6);
+});
+
 test("parent smart-zone telemetry warns at 80 percent and budget without forcing delegation or blocking", async () => {
   const h = await harness("observe"); let tokens: number | undefined = 119_999; let captured: AssessmentInput | undefined;
   h.ctx.model = { provider: "test", id: "parent", contextWindow: 272_000 };
