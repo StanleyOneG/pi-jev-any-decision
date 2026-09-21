@@ -1,18 +1,59 @@
 # Pi Jev delegation assessment
 
-A project-local Pi extension that advises the main agent whether a compact next step merits delegation. It never launches children, changes child permissions, loads into children, compacts context, or overrides pi-subagents' authority.
+A Pi extension that advises the main agent whether a compact next step merits delegation. It never launches children, changes child permissions, loads into children, compacts context, or overrides pi-subagents' authority.
 
-## Setup
+## Use in another project
+
+Requires Pi with project-trust support, tested with `@earendil-works/pi-coding-agent` 0.86.1, and a separately installed and enabled `pi-subagents` extension providing the `subagent` tool. Installing an npm dependency alone does not enable that tool.
+
+Install pi-subagents once if you do not already use it:
+
+```sh
+pi install npm:pi-subagents
+```
+
+In the project where you want assessments, create `.pi/delegation-assessment.json` with:
+
+```json
+{
+  "mode": "observe",
+  "provisionalConfidenceThreshold": 0.7,
+  "contextGrowthTokens": 16000
+}
+```
+
+Then run from that project's directory:
+
+```sh
+export TYPESAFE_API_KEY=... # keep credentials outside the repository and chat
+pi -e https://github.com/StanleyOneG/pi-jev-any-decision
+```
+
+`-e` loads the GitHub package for this run without saving it in settings. Pi installs its runtime dependencies automatically. Review the code before loading it, since extensions execute with full system access. Trust the target project when prompted. For a reviewed project in non-interactive mode, `--approve` grants trust for that run.
+
+For persistent installation, choose one scope:
+
+```sh
+pi install https://github.com/StanleyOneG/pi-jev-any-decision    # all projects
+pi install -l https://github.com/StanleyOneG/pi-jev-any-decision # current project
+```
+
+After installation, start `pi` normally. Use `pi update --extensions` to update installed packages. Append `@<tag-or-commit>` to the repository URL to pin a revision.
+
+The package exports only the delegation-assessment extension, not this repository's development skills or pi-subagents. No build step or copy of the extension is needed. It injects its assessment instructions itself; copying this repository's `AGENTS.md` is unnecessary and does not grant permission to delegate.
+
+Configuration always comes from `.pi/delegation-assessment.json` in the **target project's working directory**, never from the downloaded package. The extension is **off unless the trusted project has a valid explicit configuration**, even with `-e` or a global installation. Missing, untrusted, or malformed configuration is nonblocking `off`; it emits a Russian status warning. Use `rules-only` to avoid Jev API calls and the TypeSafe key requirement, or `off` to disable assessment. Start a new Pi session after changing configuration rather than reloading a live session.
+
+## Local development
 
 ```sh
 npm ci
-export TYPESAFE_API_KEY=... # keep credentials outside the repository and chat
 cp .pi/delegation-assessment.json.example .pi/delegation-assessment.json
 npm test
 npm run typecheck
 ```
 
-Pi discovers `.pi/extensions/delegation-assessment/index.ts` only in a trusted project. The extension is **off unless the trusted project has a valid explicit `.pi/delegation-assessment.json`**. Missing, untrusted, or malformed configuration is nonblocking `off`; it emits a Russian status warning. Do not reload a live session just to change this configuration.
+In this trusted checkout, Pi auto-discovers `.pi/extensions/delegation-assessment/index.ts`. Do not also load the GitHub copy in the same session, as both copies register the same tools. To test package loading from another directory, use `pi -e /absolute/path/to/pi-jev-any-decision` with that directory's own opt-in configuration.
 
 ## Modes and main-agent contract
 
