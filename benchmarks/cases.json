@@ -1,0 +1,49 @@
+{
+  "frozen": [
+    {
+      "id": "small-connected-fix",
+      "nextStep": "Update one connected validation branch and run its focused test.",
+      "facts": { "boundedVerifiableSubtask": true, "requiresMostParentContext": true, "largeResearch": false, "independentWork": false, "knownWriteConflict": false },
+      "candidate": { "name": "worker", "suitable": true },
+      "expectedRuleChoice": "direct"
+    },
+    {
+      "id": "broad-research",
+      "nextStep": "Research official API documentation and return a cited bounded brief.",
+      "facts": { "boundedVerifiableSubtask": true, "requiresMostParentContext": false, "largeResearch": true, "independentWork": false, "knownWriteConflict": false },
+      "candidate": { "name": "researcher", "suitable": true },
+      "expectedRuleChoice": "delegate"
+    },
+    {
+      "id": "independent-work",
+      "nextStep": "Independently inspect a bounded module and report reproducible findings.",
+      "facts": { "boundedVerifiableSubtask": true, "requiresMostParentContext": false, "largeResearch": false, "independentWork": true, "knownWriteConflict": false },
+      "candidate": { "name": "reviewer", "suitable": true },
+      "expectedRuleChoice": "delegate"
+    },
+    {
+      "id": "tight-dependency",
+      "nextStep": "Apply the next change that depends on the parent conversation's unresolved design.",
+      "facts": { "boundedVerifiableSubtask": true, "requiresMostParentContext": true, "largeResearch": false, "independentWork": true, "knownWriteConflict": false },
+      "candidate": { "name": "worker", "suitable": true },
+      "expectedRuleChoice": "direct"
+    }
+  ],
+  "holdouts": [
+    {
+      "id": "research-write-conflict",
+      "nextStep": "Research the active file while another writer owns its edits.",
+      "facts": { "boundedVerifiableSubtask": true, "requiresMostParentContext": false, "largeResearch": true, "independentWork": false, "knownWriteConflict": true },
+      "candidate": { "name": "researcher", "suitable": true },
+      "expectedRuleChoice": "direct"
+    },
+    {
+      "id": "unavailable-role",
+      "nextStep": "Independently review a bounded artifact with no available suitable role.",
+      "facts": { "boundedVerifiableSubtask": true, "requiresMostParentContext": false, "largeResearch": false, "independentWork": true, "knownWriteConflict": false },
+      "candidate": { "name": "reviewer", "suitable": false },
+      "expectedRuleChoice": "direct"
+    }
+  ],
+  "status": "task definitions only; live measurements pending"
+}

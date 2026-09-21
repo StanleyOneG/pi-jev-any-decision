@@ -1,0 +1,5 @@
+{
+  "mode": "observe",
+  "provisionalConfidenceThreshold": 0.7,
+  "contextGrowthTokens": 16000
+}

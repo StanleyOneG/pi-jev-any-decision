@@ -1,0 +1,13 @@
+node_modules/
+# Local credentials and project opt-in configuration
+.pi/delegation-assessment.json
+.env
+.env.*
+!.env.example
+# Local test and benchmark recordings
+coverage/
+.tmp/
+tmp/
+test-results/
+benchmarks/recording*.json
+*.log
