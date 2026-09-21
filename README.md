@@ -34,6 +34,30 @@ Only narrow read/control shapes (`list`, `status`, `doctor`, `guide`, `models`, 
 
 A `delegate` recommendation can instead be declined only with `delegation_refuse` and a nonblank concrete English reason attached to that exact current recommendation. UI states distinguish Jev's original choice, effective rule outcome, source (`jev`, `rules`, or service fallback), observation/enforcement mode, launch attempt/confirmation, and refusal. The stored refusal diagnostic contains only bounded metadata (identity and reason length), not the reason.
 
+## Parent context budget (smart zone)
+
+The optional project settings below work with all active modes. Existing configurations keep working with a default 150,000-token budget:
+
+```json
+{
+  "mode": "observe",
+  "provisionalConfidenceThreshold": 0.7,
+  "contextGrowthTokens": 16000,
+  "smartZoneTokens": 150000,
+  "smartZoneTokensByModel": {
+    "example-provider/example-model": 120000
+  }
+}
+```
+
+Replace the example model key with the exact `provider/id` of the **parent** model, or omit the map. Budgets must be integers of at least 1,000 tokens. The effective budget is the smaller of the configured budget and the known model window; this is not an output-token reservation. The 150k default and the warning at 80% are configurable-budget heuristics, not calibrated quality thresholds or guarantees.
+
+Each assessment supplies Jev and the tool result with `parentContext`: parent model identifier, window size, configured/effective budget, remaining tokens, state (`within`, `near`, `exceeded`, `unknown`), and explicitly unknown child context. Unknown usage/window/model values remain `null`; usage is approximate. Remaining budget floors at zero. Cached results describe the original assessment snapshot; model/window/budget/state changes participate in cache identity alongside the existing token bucket.
+
+Monitoring before working tools and during assessment warns once on entering the near-budget or reached-budget state. Returning below 80% rearms warnings; a new session/reload resets warning deduplication. Near the budget, instructions favor fresh-context children and short reports **only when existing delegation prerequisites and operator permission hold**. At the budget, they suggest a manual session handoff or compaction. There is no automatic launch, compaction, mode switch, or new gate based on the budget. Already accumulated parent context is not removed by delegating. Child usage and future task growth are not measured or predicted.
+
+This budget is separate from `contextGrowthTokens`, which expires an assessment. After large skill/reference reads, the parent must reassess with `phase: "context_growth"` and a fresh `phaseId` before the next working tool, including a child launch. Observe warnings distinguish an absent assessment, an in-flight assessment, and growth expiry (with measured growth and threshold); none blocks the tool. Read only necessary reference sections where applicable instructions allow it.
+
 ## Policy, service, and privacy limits
 
 Jev receives one typed `Choice` (`delegate`, `direct`, `insufficient_information`) and no generated explanation. The TypeSafe call uses a 5-second per-attempt timeout, `maxRetries: 0`, and Pi's cancellation signal. Runtime validation rejects malformed choices, non-numeric/string probabilities, out-of-range values, and distributions that do not sum to one.

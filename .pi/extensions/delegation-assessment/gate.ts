@@ -31,10 +31,14 @@ export class Gate {
     this.state.dispatches.clear(); this.state.dispatchConfirmed = false; this.state.refusal = undefined; return true;
   }
   invalidateAssessment(): void { this.advance(); }
-  needsAssessment(contextTokens: number | null, growth: number): boolean {
+  assessmentNeed(contextTokens: number | null, growth: number): "missing" | "pending" | "context_growth" | null {
+    if (this.state.pending) return "pending";
     const assessment = this.state.assessment;
-    if (!this.state.requestId || !assessment || this.state.assessmentGeneration !== this.state.generation || this.state.pending) return true;
-    return contextTokens !== null && assessment.contextTokens !== null && contextTokens - assessment.contextTokens >= growth;
+    if (!this.state.requestId || !assessment || this.state.assessmentGeneration !== this.state.generation) return "missing";
+    return contextTokens !== null && assessment.contextTokens !== null && contextTokens - assessment.contextTokens >= growth ? "context_growth" : null;
+  }
+  needsAssessment(contextTokens: number | null, growth: number): boolean {
+    return this.assessmentNeed(contextTokens, growth) !== null;
   }
   mayWork(mode: Mode, contextTokens: number | null, growth: number, isLaunch = false): { allowed: boolean; reason?: string } {
     if (mode !== "enforce" && mode !== "rules-only" || this.state.disabled) return { allowed: true };

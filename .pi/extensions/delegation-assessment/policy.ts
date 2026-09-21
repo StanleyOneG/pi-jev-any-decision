@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { ParentContext } from "./context-budget.ts";
 
 export type Mode = "observe" | "enforce" | "rules-only" | "off";
 export type Phase = "initial" | "transition" | "context_growth";
@@ -23,12 +24,13 @@ export interface AssessmentInput {
   roles: Role[];
   selectedCandidate: SuitableCandidate;
   contextTokens: number | null;
+  parentContext?: ParentContext;
 }
 export interface ModelJudgment { choice: Choice; confidence: number; probabilities: Record<Choice, number>; model: string; }
 export interface Assessment {
   identity: string; phase: Phase; phaseId: string; choice: Choice; effective: "delegate" | "direct";
   origin: "jev" | "rules" | "service-fallback"; confidence: number | null;
-  probabilities: Record<Choice, number> | null; contextTokens: number | null; model?: string;
+  probabilities: Record<Choice, number> | null; contextTokens: number | null; model?: string; parentContext?: ParentContext;
 }
 export interface PolicyConfig { mode: Mode; provisionalConfidenceThreshold: number; contextGrowthTokens: number; }
 export const DEFAULT_POLICY_CONFIG: PolicyConfig = { mode: "observe", provisionalConfidenceThreshold: 0.7, contextGrowthTokens: 16_000 };
@@ -37,7 +39,7 @@ function contextBucket(tokens: number | null, growth: number): string { return t
 export function assessmentIdentity(input: AssessmentInput, growth = DEFAULT_POLICY_CONFIG.contextGrowthTokens): string {
   // All semantic fields participate, but the identity is safe to persist as opaque metadata.
   const semanticKey = JSON.stringify({ requestId: input.requestId, phase: input.phase, phaseId: input.phaseId,
-    bucket: contextBucket(input.contextTokens, growth), nextStep: input.nextStep, facts: input.facts,
+    bucket: contextBucket(input.contextTokens, growth), parentContext: input.parentContext ? { ...input.parentContext, remainingTokens: undefined } : undefined, nextStep: input.nextStep, facts: input.facts,
     roles: input.roles.map(({ name, summary, available }) => ({ name, summary, available })), candidate: input.selectedCandidate });
   return createHash("sha256").update(semanticKey).digest("hex");
 }
@@ -52,7 +54,7 @@ export function rulesRecommendDelegate(input: AssessmentInput): boolean {
 }
 export function applyPolicy(input: AssessmentInput, config: PolicyConfig, judgment?: ModelJudgment, serviceFailed = false): Assessment {
   const fallback = rulesRecommendDelegate(input) ? "delegate" : "direct";
-  const base = { identity: assessmentIdentity(input, config.contextGrowthTokens), phase: input.phase, phaseId: input.phaseId, contextTokens: input.contextTokens };
+  const base = { identity: assessmentIdentity(input, config.contextGrowthTokens), phase: input.phase, phaseId: input.phaseId, contextTokens: input.contextTokens, parentContext: input.parentContext };
   if (config.mode === "rules-only") return { ...base, choice: fallback, effective: fallback, origin: "rules", confidence: null, probabilities: null };
   if (serviceFailed || !judgment || judgment.confidence < config.provisionalConfidenceThreshold || judgment.choice === "insufficient_information") {
     return { ...base, choice: judgment?.choice ?? "insufficient_information", effective: fallback,

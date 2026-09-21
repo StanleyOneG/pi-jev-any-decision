@@ -34,9 +34,10 @@ export async function askJev(input: AssessmentInput, signal: AbortSignal | undef
       },
       available_roles: input.roles.filter((role) => role.available).map((role) => ({ name: role.name, capability: role.summary })),
       context_tokens_approximate: input.contextTokens,
+      parent_context: input.parentContext ? { ...input.parentContext } : null,
     },
     questions: {
-      routing: choice("Choose the safe next-step routing. Return no explanation; application code owns policy and execution.", CRITERIA),
+      routing: choice("Choose the safe next-step routing. Parent smart-zone telemetry is a heuristic, not a quality guarantee. Near the budget, prefer independent work in a fresh child with a concise report only when all delegation prerequisites hold. A child does not remove existing parent context; child context usage is unknown. High context alone never requires delegation. Return no explanation; application code owns policy and execution.", CRITERIA),
     },
   }, { timeout: 5_000, retry: { maxRetries: 0 }, signal });
   const answer = response.answers.routing;

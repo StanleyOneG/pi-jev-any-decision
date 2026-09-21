@@ -1,5 +1,7 @@
 {
   "mode": "observe",
   "provisionalConfidenceThreshold": 0.7,
-  "contextGrowthTokens": 16000
+  "contextGrowthTokens": 16000,
+  "smartZoneTokens": 150000,
+  "smartZoneTokensByModel": {}
 }

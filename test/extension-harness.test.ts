@@ -6,8 +6,8 @@ import test from "node:test";
 import { createDelegationAssessment } from "../.pi/extensions/delegation-assessment/index.ts";
 import type { AssessmentInput, ModelJudgment } from "../.pi/extensions/delegation-assessment/policy.ts";
 
-async function harness(mode?: "observe" | "enforce" | "rules-only" | "off", trusted = true) {
-  const cwd = await mkdtemp(join(tmpdir(), "jev-extension-")); if (mode) { await mkdir(join(cwd, ".pi")); await writeFile(join(cwd, ".pi", "delegation-assessment.json"), JSON.stringify({ mode, provisionalConfidenceThreshold: .7 })); }
+async function harness(mode?: "observe" | "enforce" | "rules-only" | "off", trusted = true, extraConfig: Record<string, unknown> = {}) {
+  const cwd = await mkdtemp(join(tmpdir(), "jev-extension-")); if (mode) { await mkdir(join(cwd, ".pi")); await writeFile(join(cwd, ".pi", "delegation-assessment.json"), JSON.stringify({ mode, provisionalConfidenceThreshold: .7, ...extraConfig })); }
   const handlers = new Map<string, Array<(event: any, ctx: any) => any>>(); const tools: any[] = []; const notices: string[] = []; const entries: any[] = []; let tokens: number | undefined = 10; let sessionId = "session-1"; let usageError = false;
   const pi: any = { on(name: string, handler: any) { const list = handlers.get(name) ?? []; list.push(handler); handlers.set(name, list); return () => {}; }, registerTool(tool: any) { tools.push(tool); }, appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); }, events: { on() {}, emit() {} } };
   const ctx: any = { cwd, mode: "json", hasUI: false, signal: undefined, isProjectTrusted: () => trusted, getContextUsage: () => { if (usageError) throw new Error("usage unavailable"); return tokens === undefined ? undefined : ({ tokens, contextWindow: 100_000, percent: .01 }); }, sessionManager: { getSessionId: () => sessionId, getEntries: () => entries }, ui: { setStatus: (_k: string, text: string) => notices.push(text), notify: (text: string) => notices.push(text) } };
@@ -17,6 +17,91 @@ const input = (phaseId = "initial-1") => ({ phase: "initial", phaseId, nextStep:
 const direct: ModelJudgment = { choice: "direct", confidence: .9, probabilities: { delegate: .05, direct: .9, insufficient_information: .05 }, model: "mock" };
 async function start(h: Awaited<ReturnType<typeof harness>>) { await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx); h.handlers.get("input")![0]({ source: "interactive", text: "raw secret user text" }, h.ctx); }
 function tool(h: Awaited<ReturnType<typeof harness>>, name: string) { return h.tools.find((candidate) => candidate.name === name)!; }
+
+test("observe distinguishes missing assessment from growth expiry and provides reassessment instructions", async () => {
+  const h = await harness("observe"); createDelegationAssessment(async () => direct)(h.pi); await start(h);
+  const work = () => h.handlers.get("tool_call")![0]({ toolName: "read", toolCallId: "r", input: {} }, h.ctx);
+  assert.equal(await work(), undefined);
+  assert.match(h.notices.at(-1)!, /оценка отсутствует/);
+  await tool(h, "delegation_assess").execute("a", input(), undefined, undefined, h.ctx);
+  h.setTokens(16_010); assert.equal(await work(), undefined);
+  assert.match(h.notices.at(-1)!, /оценка устарела.*рост.*16000.*context_growth/);
+  const injected = h.handlers.get("before_agent_start")![0]({}, h.ctx).message.content;
+  assert.match(injected, /after reading large skills or reference documents/);
+  assert.match(injected, /before the next working tool, including subagent launches/);
+});
+
+test("parent smart-zone telemetry warns at 80 percent and budget without forcing delegation or blocking", async () => {
+  const h = await harness("observe"); let tokens: number | undefined = 119_999; let captured: AssessmentInput | undefined;
+  h.ctx.model = { provider: "test", id: "parent", contextWindow: 272_000 };
+  h.ctx.getContextUsage = () => tokens === undefined ? undefined : { tokens, contextWindow: 272_000 };
+  createDelegationAssessment(async (value) => { captured = value; return direct; })(h.pi); await start(h);
+  const assess = () => tool(h, "delegation_assess").execute("a", input(), undefined, undefined, h.ctx);
+  let result = await assess();
+  assert.equal(result.details.parentContext.smartZoneState, "within");
+  assert.equal(result.details.parentContext.remainingTokens, 30_001);
+  assert.equal(result.details.parentContext.contextWindowTokens, 272_000);
+  assert.equal(result.details.parentContext.model, "test/parent");
+  assert.deepEqual((captured as any).parentContext, result.details.parentContext);
+  const warnings = () => h.notices.filter((text) => text.startsWith("Smart zone:"));
+  assert.equal(warnings().length, 0);
+  tokens = 120_000; result = await assess(); assert.equal(result.details.parentContext.smartZoneState, "near");
+  assert.equal(warnings().length, 1);
+  await assess(); assert.equal(warnings().length, 1, "no warning spam on repeated assessment");
+  tokens = 150_000;
+  assert.equal(await h.handlers.get("tool_call")![0]({ toolName: "read", toolCallId: "r", input: {} }, h.ctx), undefined);
+  assert.equal(warnings().length, 2, "monitor even without a new assessment");
+  assert.match(warnings().at(-1)!, /новую сессию.*compaction.*не разгружает/);
+  result = await assess(); assert.equal(result.details.parentContext.smartZoneState, "exceeded");
+  assert.equal(result.details.effective, "direct", "budget never forces delegation");
+  tokens = undefined; result = await assess();
+  assert.equal(result.details.parentContext.smartZoneState, "unknown");
+  assert.equal(result.details.parentContext.remainingTokens, null);
+  assert.equal(result.details.parentContext.contextWindowTokens, 272_000);
+  assert.equal(result.details.parentContext.childContext, "unknown");
+});
+
+test("model overrides, physical window cap, and unknown telemetry are explicit", async () => {
+  const h = await harness("observe", true, { smartZoneTokens: 140_000, smartZoneTokensByModel: { "test/parent": 90_000 } });
+  h.ctx.model = { provider: "test", id: "parent", contextWindow: 80_000 };
+  h.ctx.getContextUsage = () => ({ tokens: 70_000, contextWindow: 80_000 });
+  createDelegationAssessment(async () => direct)(h.pi); await start(h);
+  const assess = () => tool(h, "delegation_assess").execute("a", input(), undefined, undefined, h.ctx);
+  let result = await assess();
+  assert.equal(result.details.parentContext.configuredSmartZoneTokens, 90_000);
+  assert.equal(result.details.parentContext.smartZoneTokens, 80_000);
+  assert.equal(result.details.parentContext.remainingTokens, 10_000);
+  h.ctx.model = undefined; h.ctx.getContextUsage = () => undefined;
+  result = await assess();
+  assert.equal(result.details.parentContext.model, null);
+  assert.equal(result.details.parentContext.contextWindowTokens, null);
+  assert.equal(result.details.parentContext.smartZoneTokens, 140_000);
+  assert.equal(result.details.parentContext.remainingTokens, null);
+  assert.equal(result.details.parentContext.smartZoneState, "unknown");
+});
+
+test("invalid budget configuration stays off and rules-only budget monitoring makes no API calls", async () => {
+  for (const config of [{ smartZoneTokens: null }, { smartZoneTokens: "150000" }, { smartZoneTokens: 0 }, { smartZoneTokensByModel: [] }, { smartZoneTokensByModel: { "test/parent": -1 } }]) {
+    const h = await harness("observe", true, config); let calls = 0;
+    createDelegationAssessment(async () => { calls++; return direct; })(h.pi); await start(h);
+    assert.equal((await tool(h, "delegation_assess").execute("a", input(), undefined, undefined, h.ctx)).details.mode, "off");
+    assert.equal(calls, 0);
+  }
+  const h = await harness("rules-only"); let calls = 0;
+  createDelegationAssessment(async () => { calls++; return direct; })(h.pi); await start(h); h.setTokens(150_000);
+  await tool(h, "delegation_assess").execute("a", input(), undefined, undefined, h.ctx);
+  assert.equal(calls, 0);
+  assert.ok(h.notices.some((text) => text.startsWith("Smart zone:")));
+});
+
+test("budget warning UI failure disables the extension before any API call", async () => {
+  const h = await harness("observe"); let calls = 0;
+  createDelegationAssessment(async () => { calls++; return direct; })(h.pi); await start(h); h.setTokens(150_000);
+  h.ctx.ui.notify = (text: string) => { if (text.startsWith("Smart zone:")) throw new Error("UI failed"); };
+  const result = await tool(h, "delegation_assess").execute("a", input(), undefined, undefined, h.ctx);
+  assert.equal(calls, 0);
+  assert.equal(result.details.disabled, true);
+});
 
 test("direct work reports the parent action once per assessment generation", async () => {
   const h = await harness("observe"); createDelegationAssessment(async () => direct)(h.pi); await start(h);

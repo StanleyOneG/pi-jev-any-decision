@@ -26,6 +26,18 @@ test("TypeSafe adapter uses one typed Choice and a five-second no-retry request"
   assert.equal("reason" in state, false);
 });
 
+test("TypeSafe receives parent budget telemetry and preserves unknown child context", async () => {
+  const parentContext = { model: "test/parent", contextWindowTokens: 272_000, configuredSmartZoneTokens: 150_000,
+    smartZoneTokens: 150_000, remainingTokens: 10_000, smartZoneState: "near" as const, childContext: "unknown" as const };
+  let state: any;
+  await askJev({ ...input, contextTokens: 140_000, parentContext }, undefined, () => ({ systemOne: async (request: any) => {
+    state = request.state;
+    return { model: "mock", answers: { routing: { choice: "direct", confidence: 1, probabilities: { delegate: 0, direct: 1, insufficient_information: 0 } } } } as never;
+  } } as unknown as SystemOneClient));
+  assert.equal(state.context_tokens_approximate, 140_000);
+  assert.deepEqual(state.parent_context, parentContext);
+});
+
 test("malformed, out-of-range, and cancelled Choice responses are rejected", async () => {
   for (const answer of [
     { choice: "other", confidence: 1, probabilities: {} },
