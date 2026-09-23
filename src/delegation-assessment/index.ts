@@ -277,7 +277,8 @@ export function createDelegationAssessment(ask: (input: AssessmentInput, signal:
       else if (gate.state.assessment && !gate.needsAssessment(contextTokens(ctx), config.contextGrowthTokens)
         && parentActionGeneration !== gate.state.generation) {
         parentActionGeneration = gate.state.generation;
-        const text = `Действие главного агента: продолжает работу самостоятельно; режим=${config.mode}`;
+        // A preparation tool is not evidence of a routing decision or refusal.
+        const text = `Действие главного агента: вызов инструмента ${event.toolName}; рекомендация=${gate.state.assessment.effective}; режим=${config.mode}`;
         ui(ctx, () => ctx.ui.setStatus("delegation", text));
         ui(ctx, () => ctx.ui.notify(text, "info"));
       }

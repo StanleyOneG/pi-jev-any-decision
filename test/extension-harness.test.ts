@@ -197,9 +197,29 @@ test("budget warning UI failure disables the extension before any API call", asy
   assert.equal(result.details.disabled, true);
 });
 
+test("preparation tools do not imply direct routing or refusal before a delegated launch", async () => {
+  for (const mode of ["observe", "enforce"] as const) {
+    const h = await harness(mode); createDelegationAssessment(async () => research)(h.pi); await start(h);
+    const assess = () => tool(h, "delegation_assess").execute("a", input(), undefined, undefined, h.ctx);
+    assert.equal((await assess()).details.effective, "research");
+    const call = h.handlers.get("tool_call")![0]!;
+    assert.equal(await call({ toolName: "bash", toolCallId: "prepare", input: {} }, h.ctx), undefined);
+    assert.ok(h.notices.some((text) => text.includes("вызов инструмента bash; рекомендация=research")));
+    assert.ok(!h.notices.some((text) => text.includes("продолжает работу самостоятельно")));
+    assert.ok(!h.entries.some((entry) => entry.data?.kind === "deviation"));
+    assert.equal((await assess()).details.effective, "research", "preparation must not alter the cached recommendation");
+    await call({ toolName: "subagent", toolCallId: "launch", input: { agent: "researcher", task: "Research official sources." } }, h.ctx);
+    await h.handlers.get("tool_result")![0]!({ toolName: "subagent", toolCallId: "launch", input: {}, isError: false, details: { runId: "research-run" } }, h.ctx);
+    assert.ok(h.notices.some((text) => text.includes("запуск делегирования подтверждён")));
+    const count = h.notices.length;
+    await call({ toolName: "read", toolCallId: "after-launch", input: {} }, h.ctx);
+    assert.equal(h.notices.length, count, "later parent tools must not overwrite launch telemetry in this generation");
+  }
+});
+
 test("direct work reports the parent action once per assessment generation", async () => {
   const h = await harness("observe"); createDelegationAssessment(async () => direct)(h.pi); await start(h);
-  const actions = () => h.notices.filter((text) => text.includes("Действие главного агента: продолжает работу самостоятельно"));
+  const actions = () => h.notices.filter((text) => text.includes("Действие главного агента: вызов инструмента read; рекомендация=direct"));
   await tool(h, "delegation_assess").execute("a", input(), undefined, undefined, h.ctx);
   assert.equal(actions().length, 0, "assessment alone is not an action");
   const work = () => h.handlers.get("tool_call")![0]({ toolName: "read", toolCallId: "read", input: { path: "README.md" } }, h.ctx);
