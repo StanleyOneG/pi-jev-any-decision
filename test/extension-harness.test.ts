@@ -13,8 +13,12 @@ async function harness(mode?: "observe" | "enforce" | "rules-only" | "off", trus
   const ctx: any = { cwd, mode: "json", hasUI: false, signal: undefined, isProjectTrusted: () => trusted, getContextUsage: () => { if (usageError) throw new Error("usage unavailable"); return tokens === undefined ? undefined : ({ tokens, contextWindow: 100_000, percent: .01 }); }, sessionManager: { getSessionId: () => sessionId, getEntries: () => entries }, ui: { setStatus: (_k: string, text: string) => notices.push(text), notify: (text: string) => notices.push(text) } };
   return { pi, handlers, tools, ctx, notices, entries, setTokens: (value: number | undefined) => { tokens = value; }, setUsageError: (value: boolean) => { usageError = value; }, setSessionId: (value: string) => { sessionId = value; } };
 }
-const input = (phaseId = "initial-1") => ({ phase: "initial", phaseId, nextStep: "Research official documentation and return a concise bounded brief.", facts: { boundedVerifiableSubtask: true, requiresMostParentContext: false, largeResearch: true, independentWork: false, knownWriteConflict: false }, roles: [{ name: "researcher", summary: "Research official documentation.", available: true }], selectedCandidate: { name: "researcher", suitable: true } });
-const direct: ModelJudgment = { choice: "direct", confidence: .9, probabilities: { delegate: .05, direct: .9, insufficient_information: .05 }, model: "mock" };
+const input = (phaseId = "initial-1") => ({ phase: "initial" as const, phaseId, nextStep: "Research official documentation and return a concise bounded brief.", roles: [{ name: "researcher", summary: "Research official documentation.", purpose: "research" as const, available: true, suitable: true, authorized: true, tools: ["read"] }], options: [
+  { id: "direct", kind: "direct" as const, summary: "Parent researches and verifies the documentation.", evidence: "Parent can perform the complete task.", verificationCriteria: "Cross-check the primary documentation.", roles: [], requiredTools: [], authorized: true, writeConflict: false, taskSuitability: "suitable" as const, contextDependency: "low" as const, decisionsRecorded: "documents" as const, handoffEffort: "low" as const, handoffLossRisk: "low" as const, verificationEffort: "moderate" as const, executionEffort: "high" as const, reworkRisk: "low" as const, expectedBenefit: "moderate" as const, independentReviewBenefit: "low" as const },
+  { id: "research", kind: "delegated" as const, summary: "Researcher reads official documentation and returns a brief.", evidence: "The bounded research can be checked independently.", verificationCriteria: "Verify claims against primary references.", roles: ["researcher"], requiredTools: ["read"], authorized: true, writeConflict: false, taskSuitability: "suitable" as const, contextDependency: "low" as const, decisionsRecorded: "documents" as const, handoffEffort: "low" as const, handoffLossRisk: "low" as const, verificationEffort: "low" as const, executionEffort: "moderate" as const, reworkRisk: "low" as const, expectedBenefit: "high" as const, independentReviewBenefit: "moderate" as const },
+] });
+const direct: ModelJudgment = { choice: "direct", confidence: .9, probabilities: { research: .05, direct: .85, insufficient_information: .05, revise_options: .05 }, model: "mock" };
+const research: ModelJudgment = { ...direct, choice: "research", probabilities: { research: .85, direct: .05, insufficient_information: .05, revise_options: .05 } };
 async function start(h: Awaited<ReturnType<typeof harness>>) { await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx); h.handlers.get("input")![0]({ source: "interactive", text: "raw secret user text" }, h.ctx); }
 function tool(h: Awaited<ReturnType<typeof harness>>, name: string) { return h.tools.find((candidate) => candidate.name === name)!; }
 
@@ -38,6 +42,27 @@ test("debug is opt-in, project-local, records cache and separates sessions", asy
     await tool(other, "delegation_assess").execute("a", input(), undefined, undefined, other.ctx);
     await assert.rejects(stat(join(other.ctx.cwd, ".pi/delegation-assessment-debug")), { code: "ENOENT" });
   }
+});
+
+test("rejoining an older in-flight identity spends clarification exactly once at acceptance", async () => {
+  const h = await harness("observe", true, { debug: true });
+  const pending = new Map<string, (value: ModelJudgment) => void>(); let calls = 0;
+  const abstain: ModelJudgment = { ...direct, choice: "insufficient_information" };
+  createDelegationAssessment((value) => { calls++; return new Promise((resolve) => pending.set(value.phaseId, resolve)); })(h.pi);
+  await start(h);
+  const assess = (phaseId: string) => tool(h, "delegation_assess").execute(phaseId, input(phaseId), undefined, undefined, h.ctx);
+  const a = assess("stage-a"); const b = assess("stage-b"); const aAgain = assess("stage-a");
+  assert.equal(calls, 2);
+  pending.get("stage-a")!(abstain);
+  assert.equal((await a).details.stale, true);
+  assert.equal((await aAgain).details.needsRevision, true);
+  pending.get("stage-b")!(abstain);
+  assert.equal((await b).details.stale, true);
+  const c = assess("stage-c"); pending.get("stage-c")!(abstain);
+  const result = await c;
+  assert.equal(result.details.needsRevision, false);
+  assert.equal(result.details.conservativeFallback, true);
+  assert.equal(result.details.effective, "direct");
 });
 
 test("observe distinguishes missing assessment from growth expiry and provides reassessment instructions", async () => {
@@ -188,43 +213,77 @@ test("direct work reports the parent action once per assessment generation", asy
   h.setTokens(16_010); await work(); assert.equal(actions().length, afterPhase, "expired assessments cannot label new work");
 });
 
-test("refusal uses current context and rejects the exact growth boundary", async () => {
-  const h = await harness("observe");
-  createDelegationAssessment(async () => ({ ...direct, choice: "delegate", probabilities: { delegate: .9, direct: .05, insufficient_information: .05 } }))(h.pi); await start(h);
+test("deviation accepts any fresh recommendation and growth expires it", async () => {
+  const h = await harness("enforce"); createDelegationAssessment(async () => direct)(h.pi); await start(h);
   await tool(h, "delegation_assess").execute("a", input(), undefined, undefined, h.ctx);
-  const refuse = () => tool(h, "delegation_refuse").execute("r", { reason: "The parent must preserve the single write boundary." }, undefined, undefined, h.ctx);
-  h.setTokens(16_009); assert.equal((await refuse()).details.refusalRecorded, true);
+  const deviate = () => tool(h, "delegation_deviate").execute("r", { reason: "Independent review gives a concrete quality check." }, undefined, undefined, h.ctx);
+  h.setTokens(16_009); assert.equal((await deviate()).details.deviationRecorded, true);
   const entriesBefore = h.entries.length;
   h.setTokens(16_010);
-  await assert.rejects(refuse, /current delegation recommendation/);
-  assert.equal(h.entries.length, entriesBefore, "expired refusal must not be persisted");
-  assert.equal(await h.handlers.get("tool_call")![0]({ toolName: "read", toolCallId: "r", input: {} }, h.ctx), undefined, "observe remains nonblocking");
+  await assert.rejects(deviate, /fresh routing recommendation/);
+  assert.equal(h.entries.length, entriesBefore);
   await tool(h, "delegation_assess").execute("b", input("fresh-growth"), undefined, undefined, h.ctx);
-  assert.equal((await refuse()).details.refusalRecorded, true);
+  assert.equal((await deviate()).details.deviationRecorded, true);
 });
 
-for (const action of ["refusal", "confirmed-launch", "pending-launch"] as const) {
-  test(`identical cached assessment preserves ${action}, but a new phase does not`, async () => {
-    const h = await harness("enforce"); let calls = 0;
-    createDelegationAssessment(async () => { calls++; return { ...direct, choice: "delegate", probabilities: { delegate: .9, direct: .05, insufficient_information: .05 } }; })(h.pi); await start(h);
-    const assess = (phaseId = "same-phase") => tool(h, "delegation_assess").execute("a", input(phaseId), undefined, undefined, h.ctx);
-    const work = () => h.handlers.get("tool_call")![0]({ toolName: "read", toolCallId: "read", input: {} }, h.ctx);
-    const confirm = () => h.handlers.get("tool_result")![0]({ toolName: "subagent", toolCallId: "launch", input: { agent: "researcher" }, isError: false, details: { runId: "confirmed-run" } }, h.ctx);
-    await assess();
-    if (action === "refusal") await tool(h, "delegation_refuse").execute("r", { reason: "The parent must preserve the single write boundary." }, undefined, undefined, h.ctx);
-    else {
-      assert.equal(await h.handlers.get("tool_call")![0]({ toolName: "subagent", toolCallId: "launch", input: { agent: "researcher", task: "Research documentation." } }, h.ctx), undefined);
-      if (action === "confirmed-launch") await confirm();
-    }
-    await assess(); assert.equal(calls, 1, "identical state uses the cached assessment");
-    if (action === "pending-launch") {
-      assert.equal((await work())?.block, true, "pending is not confirmation");
-      await confirm();
-    }
-    assert.equal(await work(), undefined, "the same recommendation retains its action");
-    await assess("new-phase"); assert.equal((await work())?.block, true, "a new phase needs its own action");
-  });
-}
+test("enforce permits ordinary work after delegated recommendation without launch confirmation", async () => {
+  const h = await harness("enforce"); let calls = 0;
+  createDelegationAssessment(async () => { calls++; return research; })(h.pi); await start(h);
+  const assess = (phaseId = "same-phase") => tool(h, "delegation_assess").execute("a", input(phaseId), undefined, undefined, h.ctx);
+  const work = () => h.handlers.get("tool_call")![0]({ toolName: "read", toolCallId: "read", input: {} }, h.ctx);
+  await assess(); await assess(); assert.equal(calls, 1);
+  assert.equal(await work(), undefined);
+  await tool(h, "delegation_deviate").execute("r", { reason: "The parent must preserve the single write boundary." }, undefined, undefined, h.ctx);
+  await assess("new-phase"); assert.equal(await work(), undefined);
+  assert.equal(calls, 2);
+});
+
+test("one clarification across phase ID and category; cache and concurrent shares do not spend it", async () => {
+  const h = await harness("enforce"); let calls = 0;
+  const unknown = (phaseId: string, phase: "initial" | "transition" | "context_growth" = "initial") => ({ ...input(phaseId), phase,
+    options: [input().options[0], { ...input().options[1], contextDependency: "high" as const, decisionsRecorded: "conversation" as const, handoffLossRisk: "unknown" as const }] });
+  createDelegationAssessment(async () => { calls++; return direct; })(h.pi); await start(h);
+  const assess = (params: ReturnType<typeof unknown>) => tool(h, "delegation_assess").execute("a", params, undefined, undefined, h.ctx);
+  const [first, shared] = await Promise.all([assess(unknown("first")), assess(unknown("first"))]);
+  assert.equal(first.details.needsRevision, true); assert.equal(shared.details.needsRevision, true);
+  assert.equal((await assess(unknown("first"))).details.needsRevision, true); assert.equal(calls, 1);
+  const second = await assess(unknown("revised", "transition"));
+  assert.equal(second.details.choice, "direct"); assert.equal(second.details.conservativeFallback, true);
+  assert.equal(second.details.needsRevision, false); assert.equal(second.details.effective, "direct");
+  assert.equal((await assess(unknown("third", "context_growth"))).details.needsRevision, false);
+  assert.equal(calls, 3, "later genuine assessments remain possible without another clarification");
+  h.handlers.get("input")![0]({ source: "interactive", text: "new actual request" }, h.ctx);
+  assert.equal((await assess(unknown("first"))).details.needsRevision, true);
+});
+
+test("model abstention differs from exhausted fallback across category changes and fresh input resets", async () => {
+  const h = await harness("enforce"); let calls = 0;
+  createDelegationAssessment(async () => { calls++; return { ...direct, choice: "insufficient_information", probabilities: { direct: .05, research: .05, insufficient_information: .85, revise_options: .05 } }; })(h.pi); await start(h);
+  const assess = (phaseId: string, phase: "initial" | "transition" = "initial") => tool(h, "delegation_assess").execute("a", { ...input(phaseId), phase }, undefined, undefined, h.ctx);
+  const first = await assess("one"); assert.equal(first.details.needsRevision, true); assert.equal(first.details.conservativeFallback, false);
+  const repeat = await assess("one"); assert.equal(repeat.details.needsRevision, true); assert.equal(calls, 1);
+  const second = await assess("two", "transition"); assert.equal(second.details.needsRevision, false); assert.equal(second.details.conservativeFallback, true);
+  assert.equal(second.details.effective, "direct"); assert.equal(calls, 2);
+  h.handlers.get("input")![0]({ source: "interactive", text: "genuine new request" }, h.ctx);
+  assert.equal((await assess("three")).details.needsRevision, true);
+});
+
+test("runtime config passes relative costs, rejects malformed profiles and legacy boolean calls", async () => {
+  const h = await harness("observe", true, { relativeCosts: { defaultsByPurpose: { research: "similar" }, byRole: { researcher: "higher" } } });
+  let costs: unknown; let calls = 0;
+  createDelegationAssessment(async (_input, _signal, _debug, resolved) => { calls++; costs = resolved; return research; })(h.pi); await start(h);
+  const assessor = tool(h, "delegation_assess");
+  assert.equal(assessor.parameters.properties.options.type, "array");
+  assert.equal(assessor.parameters.properties.facts, undefined);
+  await assert.rejects(() => assessor.execute("bad", { ...input(), facts: { largeResearch: true } }, undefined, undefined, h.ctx), /Legacy facts\/selectedCandidate/);
+  assert.equal(calls, 0);
+  const result = await assessor.execute("good", input(), undefined, undefined, h.ctx);
+  assert.equal(result.details.effective, "research");
+  assert.deepEqual(costs, { defaultsByPurpose: { research: "similar" }, byRole: { researcher: "higher" } });
+  const bad = await harness("observe", true, { relativeCosts: { defaultsByPurpose: { research: "cheap" } } });
+  createDelegationAssessment(async () => { throw new Error("must stay off"); })(bad.pi); await start(bad);
+  assert.equal((await tool(bad, "delegation_assess").execute("bad", input(), undefined, undefined, bad.ctx)).details.mode, "off");
+});
 
 test("off is explicit opt-in: missing/untrusted config makes no Jev calls", async () => {
   let calls = 0; const h = await harness(); createDelegationAssessment(async () => { calls++; return direct; })(h.pi); await start(h);
@@ -233,7 +292,7 @@ test("off is explicit opt-in: missing/untrusted config makes no Jev calls", asyn
   const untrusted = await harness("enforce", false); createDelegationAssessment(async () => { calls++; return direct; })(untrusted.pi); await start(untrusted); assert.equal((await tool(untrusted, "delegation_assess").execute("a", input(), undefined, undefined, untrusted.ctx)).details.mode, "off"); assert.equal(calls, 0);
 });
 
-test("enforce gates launch before marking it and admits only bounded read/control actions", async () => {
+test("enforce gates freshness, not launch confirmation, and admits only bounded read/control actions", async () => {
   const h = await harness("enforce"); createDelegationAssessment(async () => direct)(h.pi); await start(h);
   assert.equal((await h.handlers.get("tool_call")![0]({ toolName: "subagent", toolCallId: "launch", input: { agent: "worker", task: "work" } }, h.ctx))?.block, true);
   assert.equal(await h.handlers.get("tool_call")![0]({ toolName: "subagent", toolCallId: "list", input: { action: "list", capabilities: true } }, h.ctx), undefined);
@@ -242,7 +301,7 @@ test("enforce gates launch before marking it and admits only bounded read/contro
   await tool(h, "delegation_assess").execute("assessment", input(), undefined, undefined, h.ctx);
   assert.equal(await h.handlers.get("tool_call")![0]({ toolName: "subagent", toolCallId: "launch", input: { agent: "researcher", task: "work" } }, h.ctx), undefined);
   await h.handlers.get("tool_result")![0]({ toolName: "subagent", toolCallId: "launch", input: { agent: "researcher" }, isError: false, details: { ok: false } }, h.ctx);
-  assert.equal((await h.handlers.get("tool_call")![0]({ toolName: "bash", toolCallId: "work", input: {} }, h.ctx))?.block, true, "unconfirmed dispatch cannot authorize work");
+  assert.equal((await h.handlers.get("tool_call")![0]({ toolName: "bash", toolCallId: "work", input: {} }, h.ctx))?.block, undefined, "unconfirmed dispatch does not stale a fresh assessment");
 });
 
 test("rules-only is enforceable without Jev; observe reports without blocking", async () => {
@@ -264,11 +323,11 @@ test("late assessments cannot open a new request or phase and repeated state is 
   assert.equal(calls, 2);
 });
 
-test("growth, session replacement, refusal, and safe output display remain fresh and bounded", async () => {
-  const h = await harness("enforce"); createDelegationAssessment(async () => ({ ...direct, choice: "delegate", probabilities: { delegate: .9, direct: .05, insufficient_information: .05 } }))(h.pi); await start(h);
+test("growth, session replacement, deviation, and safe output display remain fresh and bounded", async () => {
+  const h = await harness("enforce"); createDelegationAssessment(async () => research)(h.pi); await start(h);
   await tool(h, "delegation_assess").execute("a", input(), undefined, undefined, h.ctx);
-  await assert.rejects(() => tool(h, "delegation_refuse").execute("r", { reason: "   " }, undefined, undefined, h.ctx));
-  await tool(h, "delegation_refuse").execute("r", { reason: "The parent needs to preserve a single write boundary." }, undefined, undefined, h.ctx);
+  await assert.rejects(() => tool(h, "delegation_deviate").execute("r", { reason: "   " }, undefined, undefined, h.ctx));
+  await tool(h, "delegation_deviate").execute("r", { reason: "The parent needs to preserve a single write boundary." }, undefined, undefined, h.ctx);
   h.setTokens(16_100); assert.equal((await h.handlers.get("tool_call")![0]({ toolName: "bash", toolCallId: "b", input: {} }, h.ctx))?.block, true);
   await h.handlers.get("session_start")![0]({ reason: "fork" }, h.ctx); assert.equal((await h.handlers.get("tool_call")![0]({ toolName: "bash", toolCallId: "c", input: {} }, h.ctx))?.block, true);
   assert.equal(h.notices.some((text) => /raw secret user text/.test(text)), false);
@@ -322,11 +381,11 @@ test("UI failures disable the gate before a Jev call, while rules-only shows no 
   assert.equal(rules.notices.some((notice) => notice.includes("Jev: START")), false);
 });
 
-test("persisted refusal data is opaque and excludes assessment and refusal prose", async () => {
-  const h = await harness("enforce"); createDelegationAssessment(async () => ({ ...direct, choice: "delegate", probabilities: { delegate: .9, direct: .05, insufficient_information: .05 } }))(h.pi); await start(h);
+test("persisted deviation data is opaque and excludes assessment and reason prose", async () => {
+  const h = await harness("enforce"); createDelegationAssessment(async () => research)(h.pi); await start(h);
   const sentinel = "SENTINEL_SUMMARY_AND_ROLE_TEXT";
-  await tool(h, "delegation_assess").execute("a", { ...input(), nextStep: `Research ${sentinel}.`, roles: [{ name: "researcher", summary: sentinel, available: true }] }, undefined, undefined, h.ctx);
-  await tool(h, "delegation_refuse").execute("r", { reason: `Concrete ${sentinel} reason.` }, undefined, undefined, h.ctx);
+  await tool(h, "delegation_assess").execute("a", { ...input(), nextStep: `Research ${sentinel}.`, roles: [{ ...input().roles[0], summary: sentinel }] }, undefined, undefined, h.ctx);
+  await tool(h, "delegation_deviate").execute("r", { reason: `Concrete ${sentinel} reason.` }, undefined, undefined, h.ctx);
   const persisted = JSON.stringify(h.entries);
   assert.equal(persisted.includes(sentinel), false);
   assert.match(persisted, /[a-f0-9]{64}/);

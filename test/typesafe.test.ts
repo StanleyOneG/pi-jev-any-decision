@@ -1,55 +1,74 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { askJev } from "../src/delegation-assessment/typesafe.ts";
-import type { SystemOneClient } from "../src/delegation-assessment/typesafe.ts";
+import { askJev, buildChoiceRequest, type SystemOneClient } from "../src/delegation-assessment/typesafe.ts";
 import type { AssessmentInput } from "../src/delegation-assessment/policy.ts";
 
-const input: AssessmentInput = {
-  requestId: "r", phase: "initial", phaseId: "initial-1", nextStep: "Research the documented API and return source links.", contextTokens: null,
-  facts: { boundedVerifiableSubtask: true, requiresMostParentContext: false, largeResearch: true, independentWork: false, knownWriteConflict: false },
-  roles: [{ name: "researcher", summary: "Official docs researcher.", available: true }], selectedCandidate: { name: "researcher", suitable: true },
+const direct = { id: "direct", kind: "direct", summary: "Parent handles decisions directly.", evidence: "Parent knows all user decisions.", verificationCriteria: "Run tests and inspect changes.", roles: [], requiredTools: [], authorized: true, writeConflict: false, taskSuitability: "suitable", contextDependency: "high", decisionsRecorded: "conversation", handoffEffort: "high", handoffLossRisk: "high", verificationEffort: "moderate", executionEffort: "moderate", reworkRisk: "low", expectedBenefit: "moderate", independentReviewBenefit: "unknown" } as const;
+const delegated = { ...direct, id: "research", kind: "delegated", summary: "Research official API documents independently.", evidence: "Official public documents cover the answer.", verificationCriteria: "Verify citations from official sources.", roles: ["researcher"], requiredTools: ["web"], contextDependency: "low", decisionsRecorded: "documents", handoffEffort: "low", handoffLossRisk: "low", expectedBenefit: "high" } as const;
+const input: AssessmentInput = { requestId: "request", phase: "initial", phaseId: "phase-one", nextStep: "Research the documented API and return source links.", contextTokens: null,
+  roles: [{ name: "researcher", summary: "Research official documentation and cite sources.", purpose: "research", available: true, suitable: true, authorized: true, tools: ["web"] }],
+  options: [{ ...direct, roles: [], requiredTools: [] }, { ...delegated, roles: ["researcher"], requiredTools: ["web"] }],
 };
+const probabilities = { direct: .05, research: .9, insufficient_information: .03, revise_options: .02 };
+const response = (choice: string, probs: Record<string, unknown> = probabilities) => ({ model: "jev-test", answers: { routing: { choice, confidence: .9, probabilities: probs } }, usage: { input_tokens: 1, output_tokens: 1 } });
+const client = (answer: unknown) => ({ systemOne: async () => answer as never } as unknown as SystemOneClient);
 
-test("TypeSafe adapter uses one typed Choice and a five-second no-retry request", async () => {
-  let captured: unknown;
-  const events: any[] = [];
-  const result = await askJev(input, undefined, () => ({
-    systemOne: async (request: unknown, options: unknown) => {
-      captured = { request, options };
-      return { model: "jev-test", answers: { routing: { choice: "delegate", confidence: 0.9, probabilities: { delegate: 0.9, direct: 0.05, insufficient_information: 0.05 } } }, usage: { input_tokens: 1, output_tokens: 1 } } as never;
-    },
-  } as unknown as SystemOneClient), async (event) => { events.push(event); });
+test("dynamic Choice compares admissible IDs with two fixed abstentions, bounded state, no retries and opt-in debug", async () => {
+  let captured: any; const events: any[] = [];
+  const result = await askJev(input, undefined, () => ({ systemOne: async (request: unknown, options: unknown) => {
+    captured = { request, options }; return response("research") as never;
+  } } as unknown as SystemOneClient), async (event) => { events.push(event); }, { defaultsByPurpose: { research: "similar" } });
+  assert.deepEqual(Object.keys(captured.request.questions.routing.criteria), ["direct", "research", "insufficient_information", "revise_options"]);
+  assert.equal(captured.request.state.roles[0].relative_cost, "similar");
+  assert.equal(result.choice, "research"); assert.deepEqual(result.probabilities, probabilities);
+  assert.deepEqual(captured.options, { timeout: 5000, retry: { maxRetries: 0 }, signal: undefined });
   assert.deepEqual(events.map((event) => event.event), ["request", "response"]);
-  assert.deepEqual(events[0].payload, (captured as any).request);
-  assert.equal(events[1].response.model, "jev-test");
+  assert.deepEqual(events[0].payload, captured.request);
   assert.equal(JSON.stringify(events).includes("headers"), false);
-  assert.equal(result.choice, "delegate");
-  assert.deepEqual(result.probabilities, { delegate: 0.9, direct: 0.05, insufficient_information: 0.05 });
-  assert.deepEqual((captured as { options: { timeout: number; retry: { maxRetries: number } } }).options, { timeout: 5000, retry: { maxRetries: 0 }, signal: undefined });
-  const state = (captured as { request: { state: Record<string, unknown> } }).request.state;
-  assert.equal("raw_user_transcript" in state, false);
-  assert.equal("reason" in state, false);
+  assert.equal("raw_user_transcript" in captured.request.state, false);
 });
 
-test("TypeSafe receives parent budget telemetry and preserves unknown child context", async () => {
-  const parentContext = { model: "test/parent", contextWindowTokens: 272_000, configuredSmartZoneTokens: 150_000,
-    smartZoneTokens: 150_000, remainingTokens: 10_000, smartZoneState: "near" as const, childContext: "unknown" as const };
-  let state: any;
-  await askJev({ ...input, contextTokens: 140_000, parentContext }, undefined, () => ({ systemOne: async (request: any) => {
-    state = request.state;
-    return { model: "mock", answers: { routing: { choice: "direct", confidence: 1, probabilities: { delegate: 0, direct: 1, insufficient_information: 0 } } } } as never;
-  } } as unknown as SystemOneClient));
-  assert.equal(state.context_tokens_approximate, 140_000);
-  assert.deepEqual(state.parent_context, parentContext);
+test("request builder filters exclusions, validates every field before client or debug call, strips parent model identifier", async () => {
+  const state = { ...input, options: [input.options[0]!, { ...input.options[1]!, writeConflict: true }], parentContext: {
+    model: "provider/private-model", contextWindowTokens: 270000, configuredSmartZoneTokens: 150000, smartZoneTokens: 150000,
+    remainingTokens: 40000, smartZoneState: "near" as const, childContext: "unknown" as const } };
+  const request = buildChoiceRequest(state);
+  assert.deepEqual(Object.keys(request.questions.routing.criteria), ["direct", "insufficient_information", "revise_options"]);
+  assert.equal(JSON.stringify(request).includes("private-model"), false);
+  assert.equal(request.state.parent_context?.smart_zone_state, "near");
+  let called = false;
+  await assert.rejects(() => askJev({ ...input, options: [input.options[0]!, { ...input.options[1]!, evidence: "密钥 must not pass" }] }, undefined,
+    () => { called = true; return client(response("direct")); }, async () => { called = true; }), /options\[1\].evidence/);
+  assert.equal(called, false);
 });
 
-test("malformed, out-of-range, and cancelled Choice responses are rejected", async () => {
+test("all forwarded identifiers reject obvious secrets before client or debug invocation", async () => {
+  const secret = "sk-abcdefghijklmnop";
+  const cases: Array<[string, (value: AssessmentInput) => void]> = [
+    ["options[0].id", (value) => { value.options[0]!.id = secret; }],
+    ["roles[0].name", (value) => { value.roles[0]!.name = secret; value.options[1]!.roles = [secret]; }],
+    ["roles[0].tools", (value) => { value.roles[0]!.tools = [secret]; }],
+    ["options[1].roles", (value) => { value.options[1]!.roles = [secret]; }],
+    ["options[1].requiredTools", (value) => { value.options[1]!.requiredTools = [secret]; }],
+  ];
+  for (const [field, mutate] of cases) {
+    const value = structuredClone(input); mutate(value); let called = false;
+    await assert.rejects(() => askJev(value, undefined, () => { called = true; return client(response("direct")); }, async () => { called = true; }),
+      (error: Error) => error.message.includes(field));
+    assert.equal(called, false, field);
+  }
+});
+
+test("malformed distributions, unknown IDs, missing keys and cancellation are rejected", async () => {
   for (const answer of [
-    { choice: "other", confidence: 1, probabilities: {} },
-    { choice: "delegate", confidence: "1", probabilities: { delegate: 1, direct: 0, insufficient_information: 0 } },
-    { choice: "delegate", confidence: 1, probabilities: { delegate: 2, direct: 0, insufficient_information: 0 } },
-    { choice: "delegate", confidence: 1, probabilities: { delegate: 0.7, direct: 0.2, insufficient_information: 0.2 } },
-  ]) await assert.rejects(() => askJev(input, undefined, () => ({ systemOne: async () => ({ model: "jev", answers: { routing: answer }, usage: { input_tokens: 0, output_tokens: 0 } } as never) } as unknown as SystemOneClient)), /Malformed|Unexpected/);
+    { ...response("research"), answers: { routing: { ...response("research").answers.routing, choice: ["research"] } } },
+    { ...response("research"), answers: { routing: { ...response("research").answers.routing, choice: { toString: () => "research" } } } },
+    response("other"), response("research", { ...probabilities, other: 0 }), response("research", { direct: 1 }),
+    response("research", { ...probabilities, direct: -1 }), response("research", { ...probabilities, direct: .6 }),
+    { ...response("research"), answers: { routing: { ...response("research").answers.routing, confidence: "1" } } },
+  ]) await assert.rejects(() => askJev(input, undefined, () => client(answer)), /Malformed/);
   const controller = new AbortController(); controller.abort();
-  await assert.rejects(() => askJev(input, controller.signal, () => ({ systemOne: async (_r: unknown, options: { signal?: AbortSignal }) => { options.signal?.throwIfAborted(); throw new Error("unreachable"); } } as unknown as SystemOneClient)));
+  await assert.rejects(() => askJev(input, controller.signal, () => ({ systemOne: async (_r: unknown, options: { signal?: AbortSignal }) => {
+    options.signal?.throwIfAborted(); throw new Error("unreachable");
+  } } as unknown as SystemOneClient)), /TypeSafe request failed/);
 });

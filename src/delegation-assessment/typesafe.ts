@@ -1,11 +1,8 @@
 import { choice, TypeSafeClient } from "@typesafe-ai/sdk";
-import type { AssessmentInput, Choice, ModelJudgment } from "./policy.ts";
+import { eligibleOptions, resolveRelativeCost, validateAssessmentInput, validateRelativeCosts, type AssessmentInput, type ModelJudgment, type RelativeCostConfig } from "./policy.ts";
 import type { DebugSink } from "./debug.ts";
 
-export interface SystemOneClient {
-  systemOne: TypeSafeClient["systemOne"];
-}
-
+export interface SystemOneClient { systemOne: TypeSafeClient["systemOne"]; }
 export type ClientFactory = () => SystemOneClient;
 
 export function createJevClient(): SystemOneClient {
@@ -14,32 +11,45 @@ export function createJevClient(): SystemOneClient {
   return new TypeSafeClient({ timeout: 5_000, retry: { maxRetries: 0 }, logLevel: "off" });
 }
 
-const CRITERIA = {
-  delegate: "Delegate only a bounded, independently verifiable next step to a suitable available role when its handoff does not require most parent context and it is large research or independent work without a known write conflict.",
-  direct: "Keep the next step with the main agent when it is small, tightly dependent, conflicts with current writes, needs most parent context, or lacks a suitable available role.",
-  insufficient_information: "Use when the bounded summary and policy facts do not support a reliable routing choice.",
+const INSTRUCTIONS = "Choose the best admissible next-stage execution option by its ID. Quality and preservation of important constraints outrank relative cost. Compare suitability, decisions recorded, handoff effort and loss, verification, execution effort, rework, and concrete independent review benefit. Unknown is not favorable evidence; lower cost alone does not establish suitability. Serial independent work can be delegated; high parent context alone does not require it. Return no explanation. Choose insufficient_information when evidence cannot support comparison; choose revise_options when evidence is sufficient but none of the submitted options is acceptable. The parent owns execution and may deviate.";
+const ABSTENTIONS = {
+  insufficient_information: "Descriptions or evidence are insufficient to compare the submitted admissible options.",
+  revise_options: "The descriptions are sufficient, but none of the submitted admissible options is acceptable.",
 } as const;
 
-export async function askJev(input: AssessmentInput, signal: AbortSignal | undefined, factory: ClientFactory = createJevClient, debug?: DebugSink): Promise<ModelJudgment> {
-  const request = {
+/** Pure, validated, bounded service payload. Never forwards model identifiers, local paths, raw transcripts or unchecked fields. */
+export function buildChoiceRequest(input: AssessmentInput, costs: RelativeCostConfig = {}) {
+  const invalid = validateAssessmentInput(input) ?? validateRelativeCosts(costs);
+  if (invalid) throw new Error(invalid);
+  const { admissible } = eligibleOptions(input);
+  const criteria: Record<string, string> = Object.create(null) as Record<string, string>;
+  for (const option of admissible) criteria[option.id] = option.summary;
+  Object.assign(criteria, ABSTENTIONS);
+  return {
     model: "jev-latest",
     state: {
       next_step: input.nextStep,
-      policy_facts: {
-        bounded_verifiable_subtask: input.facts.boundedVerifiableSubtask,
-        requires_most_parent_context: input.facts.requiresMostParentContext,
-        large_research: input.facts.largeResearch,
-        independent_work: input.facts.independentWork,
-        known_write_conflict: input.facts.knownWriteConflict,
-      },
-      available_roles: input.roles.filter((role) => role.available).map((role) => ({ name: role.name, capability: role.summary })),
+      roles: input.roles.filter((role) => admissible.some((option) => option.roles.includes(role.name))).map((role) => ({
+        id: role.name, capability: role.summary, purpose: role.purpose, relative_cost: resolveRelativeCost(role, costs), tools: role.tools,
+      })),
+      options: admissible.map((option) => ({
+        id: option.id, kind: option.kind, summary: option.summary, evidence: option.evidence, verification_criteria: option.verificationCriteria,
+        roles: option.roles, required_tools: option.requiredTools, task_suitability: option.taskSuitability,
+        context_dependency: option.contextDependency, decisions_recorded: option.decisionsRecorded, handoff_effort: option.handoffEffort,
+        handoff_loss_risk: option.handoffLossRisk, verification_effort: option.verificationEffort, execution_effort: option.executionEffort,
+        rework_risk: option.reworkRisk, expected_benefit: option.expectedBenefit, independent_review_benefit: option.independentReviewBenefit,
+      })),
       context_tokens_approximate: input.contextTokens,
-      parent_context: input.parentContext ? { ...input.parentContext } : null,
+      parent_context: input.parentContext ? { context_window_tokens: input.parentContext.contextWindowTokens,
+        smart_zone_tokens: input.parentContext.smartZoneTokens, remaining_tokens: input.parentContext.remainingTokens,
+        smart_zone_state: input.parentContext.smartZoneState, child_context: input.parentContext.childContext } : null,
     },
-    questions: {
-      routing: choice("Choose the safe next-step routing. Parent smart-zone telemetry is a heuristic, not a quality guarantee. Near the budget, prefer independent work in a fresh child with a concise report only when all delegation prerequisites hold. A child does not remove existing parent context; child context usage is unknown. High context alone never requires delegation. Return no explanation; application code owns policy and execution.", CRITERIA),
-    },
+    questions: { routing: choice(INSTRUCTIONS, criteria) },
   };
+}
+
+export async function askJev(input: AssessmentInput, signal: AbortSignal | undefined, factory: ClientFactory = createJevClient, debug?: DebugSink, costs: RelativeCostConfig = {}): Promise<ModelJudgment> {
+  const request = buildChoiceRequest(input, costs);
   // This is the JSON body supplied to systemOne, not headers or credentials.
   await debug?.({ event: "request", payload: request });
   const started = Date.now();
@@ -52,18 +62,14 @@ export async function askJev(input: AssessmentInput, signal: AbortSignal | undef
     throw new Error("TypeSafe request failed.");
   }
   await debug?.({ event: "response", elapsedMs: Date.now() - started, response: { model: response.model, answers: response.answers, usage: response.usage } });
-  const answer = response.answers.routing;
-  const raw = answer.probabilities as Record<string, unknown>;
-  const probabilities: Record<Choice, number> = {
-    delegate: raw.delegate as number,
-    direct: raw.direct as number,
-    insufficient_information: raw.insufficient_information as number,
-  };
-  const numbers = [...Object.values(probabilities), answer.confidence];
-  if (!numbers.every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1)) throw new Error("Malformed Jev Choice response.");
-  const sum = Object.values(probabilities).reduce((total, value) => total + value, 0);
-  if (Math.abs(sum - 1) > 1e-6) throw new Error("Malformed Jev Choice response.");
-  if (answer.choice !== "delegate" && answer.choice !== "direct" && answer.choice !== "insufficient_information") throw new Error("Unexpected Jev Choice response.");
-  if (typeof response.model !== "string" || !response.model) throw new Error("Malformed Jev Choice response.");
-  return { choice: answer.choice, confidence: answer.confidence, probabilities, model: response.model };
+  const answer = response.answers?.routing;
+  const keys = Object.keys(request.questions.routing.criteria);
+  const raw = answer?.probabilities;
+  if (!answer || !raw || typeof raw !== "object" || Array.isArray(raw) || typeof answer.choice !== "string" || !Object.hasOwn(request.questions.routing.criteria, answer.choice)
+    || Object.keys(raw).length !== keys.length || !keys.every((key) => Object.hasOwn(raw, key))) throw new Error("Malformed Jev Choice response.");
+  const probabilities = raw as Record<string, number>;
+  if (![...Object.values(probabilities), answer.confidence].every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1)
+    || Math.abs(Object.values(probabilities).reduce((total, value) => total + value, 0) - 1) > 1e-6
+    || typeof response.model !== "string" || !response.model) throw new Error("Malformed Jev Choice response.");
+  return { choice: answer.choice, confidence: answer.confidence, probabilities: { ...probabilities }, model: response.model };
 }

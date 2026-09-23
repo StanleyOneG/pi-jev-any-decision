@@ -1,6 +1,6 @@
 # Delegation-assessment comparison protocol
 
-This repository contains no paid-run results. Run only with approved credentials and real Pi sessions.
+This repository contains no paid-run results. **Legacy protocol only:** `cases.json` and `scripts/compare.mjs` still use binary-policy `facts` and `delegate` decisions and cannot validate dynamic routing. A future all-agent comparative study requires separate approval and migration of the fixtures/script. Do not run comparative child-execution benchmarks as part of the dynamic-routing implementation. The historical procedure below is preserved for reference, not an instruction to run it now.
 
 1. Use the frozen cases in `cases.json` to tune only the rules and provisional threshold. Keep `holdouts` unseen until comparison.
 2. Run each case in `baseline` (`off/baseline`), `rules-only`, and `jev` modes from comparable clean sessions.
