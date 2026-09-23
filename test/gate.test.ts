@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Gate } from "../.pi/extensions/delegation-assessment/gate.ts";
-import type { Assessment } from "../.pi/extensions/delegation-assessment/policy.ts";
+import { Gate } from "../src/delegation-assessment/gate.ts";
+import type { Assessment } from "../src/delegation-assessment/policy.ts";
 
 const assessment = (effective: "delegate" | "direct", identity = "one", tokens: number | null = 100): Assessment => ({ identity, phase: "initial", phaseId: identity, choice: effective, effective, origin: "rules", confidence: null, probabilities: null, contextTokens: tokens });
 

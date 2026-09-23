@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { askJev } from "../.pi/extensions/delegation-assessment/typesafe.ts";
-import type { SystemOneClient } from "../.pi/extensions/delegation-assessment/typesafe.ts";
-import type { AssessmentInput } from "../.pi/extensions/delegation-assessment/policy.ts";
+import { askJev } from "../src/delegation-assessment/typesafe.ts";
+import type { SystemOneClient } from "../src/delegation-assessment/typesafe.ts";
+import type { AssessmentInput } from "../src/delegation-assessment/policy.ts";
 
 const input: AssessmentInput = {
   requestId: "r", phase: "initial", phaseId: "initial-1", nextStep: "Research the documented API and return source links.", contextTokens: null,

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyPolicy, assessmentIdentity, DEFAULT_POLICY_CONFIG, isBoundedServiceAction, rulesRecommendDelegate, validateAssessmentInput, type AssessmentInput } from "../.pi/extensions/delegation-assessment/policy.ts";
+import { applyPolicy, assessmentIdentity, DEFAULT_POLICY_CONFIG, isBoundedServiceAction, rulesRecommendDelegate, validateAssessmentInput, type AssessmentInput } from "../src/delegation-assessment/policy.ts";
 
 const role = [{ name: "researcher", summary: "Find official documentation and return sources.", available: true }];
 const base = (facts: Partial<AssessmentInput["facts"]> = {}): AssessmentInput => ({ requestId: "request-1", phase: "initial", phaseId: "initial-1", nextStep: "Inspect official API documentation and return a bounded evidence brief.", roles: role, selectedCandidate: { name: "researcher", suitable: true }, contextTokens: 500, facts: { boundedVerifiableSubtask: true, requiresMostParentContext: false, largeResearch: false, independentWork: false, knownWriteConflict: false, ...facts } });

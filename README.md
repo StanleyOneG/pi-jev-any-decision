@@ -53,7 +53,9 @@ npm test
 npm run typecheck
 ```
 
-In this trusted checkout, Pi auto-discovers `.pi/extensions/delegation-assessment/index.ts`. Do not also load the GitHub copy in the same session, as both copies register the same tools. To test package loading from another directory, use `pi -e /absolute/path/to/pi-jev-any-decision` with that directory's own opt-in configuration.
+Sources live in `src/delegation-assessment/`. The package manifest exports `src/delegation-assessment/index.ts`; this checkout has no local extension auto-discovery, so a globally installed copy can run here without a duplicate registration.
+
+To test checkout changes, use `pi -e .` from this directory, or `pi -e /absolute/path/to/pi-jev-any-decision` from another project with its own opt-in configuration. Disable any installed copy with `pi config --local` before loading the checkout explicitly, since both copies register the same tools. Loading from GitHub with `pi -e https://github.com/StanleyOneG/pi-jev-any-decision` still uses the package manifest and needs no build step.
 
 ## Modes and main-agent contract
 

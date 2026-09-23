@@ -6,7 +6,7 @@
   "description": "Opt-in Jev delegation assessment for Pi.",
   "keywords": ["pi-package"],
   "pi": {
-    "extensions": ["./.pi/extensions/delegation-assessment/index.ts"],
+    "extensions": ["./src/delegation-assessment/index.ts"],
     "skills": [],
     "prompts": [],
     "themes": []

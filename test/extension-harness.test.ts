@@ -3,8 +3,8 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createDelegationAssessment } from "../.pi/extensions/delegation-assessment/index.ts";
-import type { AssessmentInput, ModelJudgment } from "../.pi/extensions/delegation-assessment/policy.ts";
+import { createDelegationAssessment } from "../src/delegation-assessment/index.ts";
+import type { AssessmentInput, ModelJudgment } from "../src/delegation-assessment/policy.ts";
 
 async function harness(mode?: "observe" | "enforce" | "rules-only" | "off", trusted = true, extraConfig: Record<string, unknown> = {}) {
   const cwd = await mkdtemp(join(tmpdir(), "jev-extension-")); if (mode) { await mkdir(join(cwd, ".pi")); await writeFile(join(cwd, ".pi", "delegation-assessment.json"), JSON.stringify({ mode, provisionalConfidenceThreshold: .7, ...extraConfig })); }
