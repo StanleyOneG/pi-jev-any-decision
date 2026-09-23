@@ -7,6 +7,13 @@
   "smartZoneTokensByModel": {},
   "relativeCosts": {
     "defaultsByPurpose": {},
-    "byRole": {}
+    "byRole": {
+      "scout": "lower",
+      "researcher": "lower",
+      "worker": "lower",
+      "delegate": "lower",
+      "reviewer": "similar",
+      "oracle": "similar"
+    }
   }
 }
