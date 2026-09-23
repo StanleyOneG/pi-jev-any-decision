@@ -44,6 +44,39 @@ The package exports only the delegation-assessment extension, not this repositor
 
 Configuration always comes from `.pi/delegation-assessment.json` in the **target project's working directory**, never from the downloaded package. The extension is **off unless the trusted project has a valid explicit configuration**, even with `-e` or a global installation. Missing, untrusted, or malformed configuration is nonblocking `off`; it emits a Russian status warning. Use `rules-only` to avoid Jev API calls and the TypeSafe key requirement, or `off` to disable assessment. Start a new Pi session after changing configuration rather than reloading a live session.
 
+## Repository-local debug log
+
+To inspect TypeSafe requests, add `"debug": true` to the **target project's** `.pi/delegation-assessment.json`, preserving its other settings:
+
+```json
+{
+  "mode": "observe",
+  "debug": true
+}
+```
+
+Start a new Pi session after changing configuration. Debug is off by default. The extension shows the log path at session start:
+
+```text
+<target-project-cwd>/.pi/delegation-assessment-debug/<pi-session-id>.jsonl
+```
+
+Logs belong to the working directory where Pi loads the project configuration, not to the installed extension. Start Pi at the repository root to store them there. A shell command targeting another repository does not move the session's log. Every row includes the absolute working directory, session ID and timestamp. Resuming the same session appends to its file; another session gets another file.
+
+The JSONL records include:
+
+- `assessment`: validated tool input, correlation IDs and source (`service`, `cache`, `in_flight`, or `rules`).
+- `request`: the JSON body supplied to TypeSafe `systemOne`, including state and routing criteria. This records an attempted SDK call, not proof of delivery to the server.
+- `response`: model, answers, usage and elapsed time, before local response validation.
+- `service_error`: elapsed time and cancellation flag, without the potentially sensitive SDK error text.
+- `result`: the effective local policy result; `discarded` marks stale assessments.
+
+Cached/shared assessments do not generate a second service request. `rules-only` records assessments/results without sending to TypeSafe; `off` and untrusted projects write no debug logs. Request rows are SDK-boundary body snapshots, not packet captures; HTTP headers and the API key are not recorded. SDK logging remains off.
+
+The directory contains its own `.gitignore` with `*`, so logs are ignored in target repositories without editing their root ignore file. Log files use owner-only permissions. Symlinked diagnostic paths are rejected. Write failures warn once and do not change assessment behavior. No automatic retention or rotation is provided; delete old logs manually.
+
+**Logs contain task summaries and role descriptions.** Secret checks are imperfect: do not place credentials or confidential raw data in tool arguments. Review logs before sharing them. Set `"debug": false` and start a new session to stop recording; existing files remain.
+
 ## Local development
 
 ```sh
@@ -107,7 +140,7 @@ Jev receives one typed `Choice` (`delegate`, `direct`, `insufficient_information
 
 The deterministic policy is an intentional hard prerequisite, not a claimed security boundary: delegate only a bounded/verifiable step with an explicitly suitable available role, no need for most parent context, no write conflict, and large research or independent work. Jev remains an advisory semantic preference within that envelope. The confidence threshold is **uncalibrated**.
 
-English and obvious-secret checks are practical guards, not a promise of perfect language or secret detection. Do not put raw transcripts, code, logs, or credentials in a summary. The extension does not persist extra diagnostic copies of those inputs or model rationale. Pi may still persist tool-call arguments in its host session format, so the extension cannot promise that the host never stores them.
+English and obvious-secret checks are practical guards, not a promise of perfect language or secret detection. Do not put raw transcripts, code, logs, or credentials in a summary. By default the extension does not persist extra diagnostic copies of those inputs or model rationale. Opt-in debug logging persists assessment inputs and TypeSafe request/response bodies in the target project as described above. Pi may still persist tool-call arguments in its host session format, so the extension cannot promise that the host never stores them.
 
 Service failure, low confidence, insufficient information, or malformed service output use deterministic fallback and remain visible. A true internal extension malfunction—including a UI failure—disables only this extension's gate for the rest of the session, with a best-effort warning; normal pi-subagents behavior continues. Normal invalid tool input remains a repairable tool error and does not disable the extension. A disabled extension makes no Jev calls. The disabled marker is owned by the current Pi session ID: it restores on startup, resume, and reload of that same session, but not into a new or forked session.
 

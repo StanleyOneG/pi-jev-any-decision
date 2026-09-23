@@ -1,6 +1,7 @@
 node_modules/
 # Local credentials and project opt-in configuration
 .pi/delegation-assessment.json
+.pi/delegation-assessment-debug/
 .env
 .env.*
 !.env.example

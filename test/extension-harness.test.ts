@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -17,6 +17,28 @@ const input = (phaseId = "initial-1") => ({ phase: "initial", phaseId, nextStep:
 const direct: ModelJudgment = { choice: "direct", confidence: .9, probabilities: { delegate: .05, direct: .9, insufficient_information: .05 }, model: "mock" };
 async function start(h: Awaited<ReturnType<typeof harness>>) { await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx); h.handlers.get("input")![0]({ source: "interactive", text: "raw secret user text" }, h.ctx); }
 function tool(h: Awaited<ReturnType<typeof harness>>, name: string) { return h.tools.find((candidate) => candidate.name === name)!; }
+
+test("debug is opt-in, project-local, records cache and separates sessions", async () => {
+  const h = await harness("observe", true, { debug: true }); let calls = 0;
+  createDelegationAssessment(async (_input, _signal, debug) => { calls++; await debug?.({ event: "request", payload: { model: "mock" } }); return direct; })(h.pi);
+  await start(h);
+  const assess = () => tool(h, "delegation_assess").execute("a", input(), undefined, undefined, h.ctx);
+  await Promise.all([assess(), assess()]); await assess();
+  const directory = join(h.ctx.cwd, ".pi/delegation-assessment-debug");
+  const rows = (await readFile(join(directory, "session-1.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(calls, 1);
+  assert.deepEqual(rows.filter((row) => row.event === "assessment").map((row) => row.source), ["service", "in_flight", "cache"]);
+  assert.equal(rows.filter((row) => row.event === "request").length, 1);
+  assert.equal(rows.find((row) => row.event === "assessment").input.nextStep, input().nextStep);
+  assert.ok(!JSON.stringify(rows).includes("raw secret user text"));
+  h.setSessionId("session-2"); await start(h); await assess();
+  assert.ok((await stat(join(directory, "session-2.jsonl"))).isFile());
+  for (const [mode, trusted, config] of [["observe", true, {}], ["off", true, { debug: true }], ["observe", false, { debug: true }], ["observe", true, { debug: "yes" }]] as const) {
+    const other = await harness(mode, trusted, config); createDelegationAssessment(async () => direct)(other.pi); await start(other);
+    await tool(other, "delegation_assess").execute("a", input(), undefined, undefined, other.ctx);
+    await assert.rejects(stat(join(other.ctx.cwd, ".pi/delegation-assessment-debug")), { code: "ENOENT" });
+  }
+});
 
 test("observe distinguishes missing assessment from growth expiry and provides reassessment instructions", async () => {
   const h = await harness("observe"); createDelegationAssessment(async () => direct)(h.pi); await start(h);

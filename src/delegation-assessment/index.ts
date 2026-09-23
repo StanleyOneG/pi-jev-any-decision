@@ -7,16 +7,18 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Gate } from "./gate.ts";
 import { DEFAULT_BUDGET_CONFIG, parentContext, validBudget, type BudgetConfig, type ParentContext } from "./context-budget.ts";
 import { askJev } from "./typesafe.ts";
+import { createDebugLog, type DebugSink } from "./debug.ts";
 import { DEFAULT_POLICY_CONFIG, applyPolicy, assessmentIdentity, isBoundedServiceAction, isWorkingTool, validateAssessmentInput, validateEnglishSafe, type Assessment, type AssessmentInput, type PolicyConfig } from "./policy.ts";
 
 const CUSTOM_TYPE = "delegation-assessment";
 const MAX_CACHE = 20;
-interface RuntimeConfig extends PolicyConfig, BudgetConfig { enabled: boolean; }
+interface RuntimeConfig extends PolicyConfig, BudgetConfig { enabled: boolean; debug?: boolean; }
 const OFF_CONFIG: RuntimeConfig = { ...DEFAULT_POLICY_CONFIG, ...DEFAULT_BUDGET_CONFIG, mode: "off", enabled: false };
 
 function parseConfig(raw: unknown): RuntimeConfig | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   const value = raw as Record<string, unknown>;
+  if (value.debug !== undefined && typeof value.debug !== "boolean") return undefined;
   const mode = value.mode ?? "observe";
   if (mode !== "observe" && mode !== "enforce" && mode !== "rules-only" && mode !== "off") return undefined;
   const threshold = value.provisionalConfidenceThreshold ?? DEFAULT_POLICY_CONFIG.provisionalConfidenceThreshold;
@@ -26,7 +28,7 @@ function parseConfig(raw: unknown): RuntimeConfig | undefined {
   const overrides = value.smartZoneTokensByModel === undefined ? {} : value.smartZoneTokensByModel;
   if (!validBudget(smartZoneTokens) || !overrides || typeof overrides !== "object" || Array.isArray(overrides)
     || !Object.entries(overrides).every(([key, budget]) => /^[^\s/]+\/[^\s]+$/.test(key) && validBudget(budget))) return undefined;
-  return { enabled: mode !== "off", mode, provisionalConfidenceThreshold: threshold, contextGrowthTokens: growth,
+  return { enabled: mode !== "off", debug: value.debug === true, mode, provisionalConfidenceThreshold: threshold, contextGrowthTokens: growth,
     smartZoneTokens, smartZoneTokensByModel: overrides as Record<string, number> };
 }
 async function loadConfig(ctx: ExtensionContext): Promise<{ config: RuntimeConfig; warning?: string }> {
@@ -63,12 +65,13 @@ function disabledForSession(ctx: ExtensionContext, sessionId: string | undefined
 }
 
 /** Factory is exported only to inject a deterministic client in tests; production uses askJev. */
-export function createDelegationAssessment(ask: (input: AssessmentInput, signal: AbortSignal | undefined) => Promise<import("./policy.ts").ModelJudgment> = askJev): (pi: ExtensionAPI) => void {
+export function createDelegationAssessment(ask: (input: AssessmentInput, signal: AbortSignal | undefined, debug?: DebugSink) => Promise<import("./policy.ts").ModelJudgment> = (input, signal, debug) => askJev(input, signal, undefined, debug)): (pi: ExtensionAPI) => void {
   return (pi) => {
     if (process.env.PI_SUBAGENT_CHILD === "1") return;
     const gate = new Gate();
     let config = OFF_CONFIG;
     let sessionId: string | undefined;
+    let debugLog: ReturnType<typeof createDebugLog> | undefined;
     let runActive = false;
     let requestPreparedForRun = false;
     let directActionGeneration: number | undefined;
@@ -117,7 +120,15 @@ export function createDelegationAssessment(ask: (input: AssessmentInput, signal:
         gate.resetSession(); budgetWarningKey = undefined;
         cache.clear(); inFlight.clear(); runActive = false; requestPreparedForRun = false;
         sessionId = currentSessionId(ctx);
+        debugLog = undefined;
         const loaded = await loadConfig(ctx); config = loaded.config;
+        if (config.enabled && config.debug && sessionId) {
+          try {
+            debugLog = createDebugLog(ctx.cwd, sessionId, () => ctx.ui.notify("Debug: запись журнала недоступна; оценка продолжается без журнала.", "warning"));
+            await debugLog.write({ event: "session", mode: config.mode });
+            ctx.ui.notify(`Debug: ${debugLog.path}`, "info");
+          } catch { debugLog = undefined; }
+        }
         // Fork/new intentionally do not inherit a disabled marker copied from another branch.
         if ((event.reason === "startup" || event.reason === "resume" || event.reason === "reload") && disabledForSession(ctx, sessionId)) gate.disable();
         const state = gate.state.disabled
@@ -171,7 +182,12 @@ export function createDelegationAssessment(ask: (input: AssessmentInput, signal:
         const identity = assessmentIdentity(input, config.contextGrowthTokens);
         const snapshot = gate.beginAssessment(identity);
         if (!snapshot) throw new Error("No active user request to assess.");
+        const log = debugLog;
+        const debug: DebugSink | undefined = log ? (event) => log.write({ ...event, assessmentIdentity: identity, requestId, toolCallId: _id, phase: input.phase, phaseId: input.phaseId }) : undefined;
         let assessment = cache.get(identity);
+        const source = assessment ? "cache" : inFlight.has(identity) ? "in_flight" : config.mode === "rules-only" ? "rules" : "service";
+        // Queue without yielding: same-state calls must see inFlight registered below.
+        const recorded = debug?.({ event: "assessment", source, input });
         if (!assessment) {
           let task = inFlight.get(identity);
           if (!task) {
@@ -179,7 +195,7 @@ export function createDelegationAssessment(ask: (input: AssessmentInput, signal:
               let judgment; let serviceFailed = false;
               if (config.mode !== "rules-only") {
                 if (!ui(ctx, () => ctx.ui.notify("Jev: START; выполняется оценка.", "info"))) return applyPolicy(input, config, undefined, true);
-                try { judgment = await ask(input, signal); }
+                try { judgment = await ask(input, signal, debug); }
                 catch (error) {
                   if (signal?.aborted) throw new Error("Assessment cancelled.");
                   serviceFailed = true;
@@ -192,13 +208,15 @@ export function createDelegationAssessment(ask: (input: AssessmentInput, signal:
           }
           assessment = await task;
           // A completed call may only populate the cache for its exact still-current generation.
-          if (!gate.isCurrent(snapshot)) { displayResult(ctx, assessment, "discarded"); return { content: [{ type: "text", text: "Discarded stale assessment." }], details: { stale: true } }; }
+          if (!gate.isCurrent(snapshot)) { await debug?.({ event: "discarded" }); displayResult(ctx, assessment, "discarded"); return { content: [{ type: "text", text: "Discarded stale assessment." }], details: { stale: true } }; }
           cache.set(identity, assessment);
           if (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value as string);
         }
-        if (!gate.record(snapshot, assessment)) { displayResult(ctx, assessment, "discarded"); return { content: [{ type: "text", text: "Discarded stale assessment." }], details: { stale: true } }; }
+        await recorded;
+        if (!gate.record(snapshot, assessment)) { await debug?.({ event: "discarded" }); displayResult(ctx, assessment, "discarded"); return { content: [{ type: "text", text: "Discarded stale assessment." }], details: { stale: true } }; }
         displayResult(ctx, assessment, "result");
         const result = render(assessment);
+        await debug?.({ event: "result", source, result });
         return { content: [{ type: "text", text: JSON.stringify({ observation: config.mode === "observe", ...result }) }], details: result };
       } catch (error) {
         if ((error as Error).message === "Assessment cancelled.") {

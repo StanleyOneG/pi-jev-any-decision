@@ -12,12 +12,17 @@ const input: AssessmentInput = {
 
 test("TypeSafe adapter uses one typed Choice and a five-second no-retry request", async () => {
   let captured: unknown;
+  const events: any[] = [];
   const result = await askJev(input, undefined, () => ({
     systemOne: async (request: unknown, options: unknown) => {
       captured = { request, options };
       return { model: "jev-test", answers: { routing: { choice: "delegate", confidence: 0.9, probabilities: { delegate: 0.9, direct: 0.05, insufficient_information: 0.05 } } }, usage: { input_tokens: 1, output_tokens: 1 } } as never;
     },
-  } as unknown as SystemOneClient));
+  } as unknown as SystemOneClient), async (event) => { events.push(event); });
+  assert.deepEqual(events.map((event) => event.event), ["request", "response"]);
+  assert.deepEqual(events[0].payload, (captured as any).request);
+  assert.equal(events[1].response.model, "jev-test");
+  assert.equal(JSON.stringify(events).includes("headers"), false);
   assert.equal(result.choice, "delegate");
   assert.deepEqual(result.probabilities, { delegate: 0.9, direct: 0.05, insufficient_information: 0.05 });
   assert.deepEqual((captured as { options: { timeout: number; retry: { maxRetries: number } } }).options, { timeout: 5000, retry: { maxRetries: 0 }, signal: undefined });

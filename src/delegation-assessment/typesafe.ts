@@ -1,5 +1,6 @@
 import { choice, TypeSafeClient } from "@typesafe-ai/sdk";
 import type { AssessmentInput, Choice, ModelJudgment } from "./policy.ts";
+import type { DebugSink } from "./debug.ts";
 
 export interface SystemOneClient {
   systemOne: TypeSafeClient["systemOne"];
@@ -19,9 +20,8 @@ const CRITERIA = {
   insufficient_information: "Use when the bounded summary and policy facts do not support a reliable routing choice.",
 } as const;
 
-export async function askJev(input: AssessmentInput, signal: AbortSignal | undefined, factory: ClientFactory = createJevClient): Promise<ModelJudgment> {
-  const client = factory();
-  const response = await client.systemOne({
+export async function askJev(input: AssessmentInput, signal: AbortSignal | undefined, factory: ClientFactory = createJevClient, debug?: DebugSink): Promise<ModelJudgment> {
+  const request = {
     model: "jev-latest",
     state: {
       next_step: input.nextStep,
@@ -39,7 +39,19 @@ export async function askJev(input: AssessmentInput, signal: AbortSignal | undef
     questions: {
       routing: choice("Choose the safe next-step routing. Parent smart-zone telemetry is a heuristic, not a quality guarantee. Near the budget, prefer independent work in a fresh child with a concise report only when all delegation prerequisites hold. A child does not remove existing parent context; child context usage is unknown. High context alone never requires delegation. Return no explanation; application code owns policy and execution.", CRITERIA),
     },
-  }, { timeout: 5_000, retry: { maxRetries: 0 }, signal });
+  };
+  // This is the JSON body supplied to systemOne, not headers or credentials.
+  await debug?.({ event: "request", payload: request });
+  const started = Date.now();
+  let response;
+  try {
+    response = await factory().systemOne(request, { timeout: 5_000, retry: { maxRetries: 0 }, signal });
+  } catch {
+    await debug?.({ event: "service_error", elapsedMs: Date.now() - started, cancelled: signal?.aborted === true });
+    // Do not persist SDK errors: they can contain server bodies or credentials.
+    throw new Error("TypeSafe request failed.");
+  }
+  await debug?.({ event: "response", elapsedMs: Date.now() - started, response: { model: response.model, answers: response.answers, usage: response.usage } });
   const answer = response.answers.routing;
   const raw = answer.probabilities as Record<string, unknown>;
   const probabilities: Record<Choice, number> = {
