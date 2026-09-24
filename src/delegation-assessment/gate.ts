@@ -8,7 +8,11 @@ export interface GateState {
 }
 export class Gate {
   readonly state: GateState = { generation: 0, dispatches: new Map(), disabled: false, warned: false };
-  newRequest(requestId: string): void { this.state.requestId = requestId; this.advance(); }
+  newRequest(requestId: string): void {
+    const accepted = !this.state.pending ? this.state.assessment : undefined;
+    this.state.requestId = requestId; this.advance();
+    if (accepted) { this.state.assessment = accepted; this.state.assessmentGeneration = this.state.generation; }
+  }
   resetSession(): void { this.state.requestId = undefined; this.advance(); this.state.disabled = false; this.state.warned = false; }
   private advance(): void { this.state.generation++; this.state.assessment = undefined; this.state.assessmentGeneration = undefined; this.state.pending = undefined; this.state.dispatches.clear(); this.state.deviation = undefined; }
   snapshot(): GateSnapshot | undefined { return this.state.requestId ? { requestId: this.state.requestId, generation: this.state.generation } : undefined; }

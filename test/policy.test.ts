@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyPolicy, assessmentIdentity, DEFAULT_POLICY_CONFIG, eligibleOptions, isBoundedServiceAction, isWorkingTool, resolveRelativeCost, validateAssessmentInput, validateRelativeCosts, type AssessmentInput, type ExecutionOption } from "../src/delegation-assessment/policy.ts";
+import { applyPolicy, assessmentIdentity, DEFAULT_POLICY_CONFIG, eligibleOptions, noComparison, normalizeAssessmentInput, isBoundedServiceAction, isWorkingTool, resolveRelativeCost, validateAssessmentInput, validateRelativeCosts, type AssessmentInput, type ExecutionOption } from "../src/delegation-assessment/policy.ts";
 
 const direct: ExecutionOption = { id: "direct", kind: "direct", summary: "Keep complex decisions with the parent agent.", evidence: "The parent retains important discussion context.", verificationCriteria: "Run focused tests and check the output.", roles: [], requiredTools: [], authorized: true, writeConflict: false, taskSuitability: "suitable", contextDependency: "high", decisionsRecorded: "conversation", handoffEffort: "high", handoffLossRisk: "high", verificationEffort: "moderate", executionEffort: "moderate", reworkRisk: "low", expectedBenefit: "moderate", independentReviewBenefit: "unknown" };
 const delegate: ExecutionOption = { ...direct, id: "serial_research", kind: "delegated", summary: "Delegate independent serial documentation research.", evidence: "Official public documentation is sufficient.", verificationCriteria: "Check links against official documentation.", roles: ["researcher"], requiredTools: ["web"], contextDependency: "low", decisionsRecorded: "documents", handoffEffort: "low", handoffLossRisk: "low", expectedBenefit: "high", independentReviewBenefit: "low" };
@@ -72,6 +72,66 @@ test("all text and categorical fields validated with field-specific repair error
   assert.match(validateAssessmentInput(input([delegate])) ?? "", /direct baseline/);
   assert.match(validateAssessmentInput(input([direct, { ...delegate, id: "revise_options" }])) ?? "", /reserved/);
   assert.match(validateRelativeCosts({ byRole: { researcher: "cheap" } }) ?? "", /relativeCosts.byRole.researcher/);
+});
+
+test("compact direct normalizes to admissible baseline without invented comparison evidence", () => {
+  const compact = { id: "direct", kind: "direct" as const, summary: direct.summary, evidence: direct.evidence, verificationCriteria: direct.verificationCriteria };
+  const state = normalizeAssessmentInput({ ...input(), roles: undefined, options: [compact, delegate] }, input().roles);
+  assert.deepEqual(state.roles, input().roles);
+  assert.deepEqual(state.options[0], { ...compact, roles: [], requiredTools: [], authorized: true, writeConflict: false, taskSuitability: "suitable",
+    contextDependency: "unknown", decisionsRecorded: "unknown", handoffEffort: "unknown", handoffLossRisk: "unknown", verificationEffort: "unknown", executionEffort: "unknown", reworkRisk: "unknown", expectedBenefit: "unknown", independentReviewBenefit: "unknown" });
+  assert.equal(validateAssessmentInput(state), undefined);
+  assert.deepEqual(normalizeAssessmentInput({ ...input(), options: [direct, delegate] }).options[0], direct);
+});
+
+test("direct-only reason is required and validated even for local routing", () => {
+  assert.throws(() => normalizeAssessmentInput({ ...input(), options: [direct] }), /noDelegationReason/);
+  const reason = { code: "trivial_continuation" as const, detail: "Only a short direct continuation is useful." };
+  assert.deepEqual(normalizeAssessmentInput({ ...input(), options: [direct], noDelegationReason: reason }).noDelegationReason, reason);
+  for (const invalid of [{ code: "other", detail: reason.detail }, { code: reason.code, detail: "api_key=supersecret" }, { code: reason.code, detail: "中文 forbidden" }, { code: reason.code, detail: "x".repeat(301) }, { ...reason, extra: true }]) {
+    assert.throws(() => normalizeAssessmentInput({ ...input(), options: [direct], noDelegationReason: invalid as never }), /noDelegationReason/);
+  }
+  assert.throws(() => normalizeAssessmentInput({ ...input(), noDelegationReason: { ...reason, detail: "secret: abc" } }), /noDelegationReason/);
+});
+
+test("explicit direct fields cannot silently override admissibility or hide unsafe values", () => {
+  for (const option of [
+    { ...direct, roles: ["researcher"] }, { ...direct, requiredTools: ["web"] }, { ...direct, authorized: false },
+    { ...direct, writeConflict: true }, { ...direct, taskSuitability: "unknown" }, { ...direct, handoffEffort: "bad" },
+    { ...direct, evidence: "Bearer abcdefghijklmnopqrstuvwxyz" }, { ...direct, requiredTools: 4 },
+  ]) assert.throws(() => normalizeAssessmentInput({ ...input(), options: [option as never, delegate] }), /options\[0\]/);
+  assert.throws(() => normalizeAssessmentInput({ ...input(), roles: [], options: [direct, delegate] }), /options\[1\].roles.*researcher/);
+  assert.throws(() => normalizeAssessmentInput({ ...input(), facts: {}, options: [direct, delegate] } as never), /unsupported fields/);
+});
+
+test("no comparison requires only direct admissible and no unresolved transfer", () => {
+  const reason = { code: "handoff_not_worthwhile" as const, detail: "No useful delegation is available." };
+  const onlyDirect = normalizeAssessmentInput({ ...input(), options: [direct], noDelegationReason: reason });
+  assert.equal(noComparison(onlyDirect), true);
+  const filtered = input([direct, { ...delegate, writeConflict: true }]);
+  assert.equal(noComparison(filtered), true);
+  assert.deepEqual(eligibleOptions(filtered).excluded, [{ optionId: "serial_research", reasons: ["write_conflict"] }]);
+  assert.equal(noComparison(input([direct, { ...delegate, contextDependency: "high", handoffLossRisk: "unknown" }])), false);
+  assert.equal(noComparison(input()), false);
+  const result = applyPolicy(filtered, DEFAULT_POLICY_CONFIG);
+  assert.equal(result.reason, "no_comparison"); assert.equal(result.origin, "rules"); assert.equal(result.confidence, null);
+  assert.equal(applyPolicy(input(), DEFAULT_POLICY_CONFIG, { ...judgment("serial_research"), confidence: .4 }).reason, "low_confidence");
+});
+
+test("benign token and password prose passes while labeled and formatted secrets fail in every model-bound field", () => {
+  const safe = "Compare token budget, token overhead, password handling, and secret checks.";
+  const state = input(); state.nextStep = safe; state.roles[0]!.summary = safe;
+  for (const option of state.options) { option.summary = safe; option.evidence = safe; option.verificationCriteria = safe; }
+  assert.equal(validateAssessmentInput(state), undefined);
+  for (const text of ["token=abc123", "password: abc123", "Bearer abcdef123456", "bearer: abcdef123456", "bearer=abcdef123456", "-----BEGIN PRIVATE KEY-----", "sk-abcdefghijklmnop", "ghp_abcdefghijklmnop"]) {
+    for (const update of [
+      (value: AssessmentInput) => { value.nextStep = text; },
+      (value: AssessmentInput) => { value.roles[0]!.summary = text; },
+      (value: AssessmentInput) => { value.options[0]!.summary = text; },
+      (value: AssessmentInput) => { value.options[0]!.evidence = text; },
+      (value: AssessmentInput) => { value.options[0]!.verificationCriteria = text; },
+    ]) { const value = structuredClone(state); update(value); assert.ok(validateAssessmentInput(value), text); }
+  }
 });
 
 test("bounded read actions remain exempt; working tools remain identified", () => {

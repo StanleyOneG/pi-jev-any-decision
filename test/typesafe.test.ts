@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { askJev, buildChoiceRequest, type SystemOneClient } from "../src/delegation-assessment/typesafe.ts";
-import type { AssessmentInput } from "../src/delegation-assessment/policy.ts";
+import { normalizeAssessmentInput, type AssessmentInput } from "../src/delegation-assessment/policy.ts";
+import { DELEGATION_ASSESS_PARAMS } from "../src/delegation-assessment/schema.ts";
+import { Value } from "typebox/value";
 
 const direct = { id: "direct", kind: "direct", summary: "Parent handles decisions directly.", evidence: "Parent knows all user decisions.", verificationCriteria: "Run tests and inspect changes.", roles: [], requiredTools: [], authorized: true, writeConflict: false, taskSuitability: "suitable", contextDependency: "high", decisionsRecorded: "conversation", handoffEffort: "high", handoffLossRisk: "high", verificationEffort: "moderate", executionEffort: "moderate", reworkRisk: "low", expectedBenefit: "moderate", independentReviewBenefit: "unknown" } as const;
 const delegated = { ...direct, id: "research", kind: "delegated", summary: "Research official API documents independently.", evidence: "Official public documents cover the answer.", verificationCriteria: "Verify citations from official sources.", roles: ["researcher"], requiredTools: ["web"], contextDependency: "low", decisionsRecorded: "documents", handoffEffort: "low", handoffLossRisk: "low", expectedBenefit: "high" } as const;
@@ -57,6 +59,46 @@ test("all forwarded identifiers reject obvious secrets before client or debug in
       (error: Error) => error.message.includes(field));
     assert.equal(called, false, field);
   }
+});
+
+test("labeled bearer credentials are rejected in prose and identifiers before client or debug invocation", async () => {
+  for (const secret of ["bearer: abcdef123456", "bearer=abcdef123456", "bearer:abcdef123456"]) {
+    for (const mutate of [
+      (value: AssessmentInput) => { value.nextStep = secret; },
+      (value: AssessmentInput) => { value.roles[0]!.summary = secret; },
+      (value: AssessmentInput) => { value.options[0]!.evidence = secret; },
+      (value: AssessmentInput) => { value.options[1]!.verificationCriteria = secret; },
+      (value: AssessmentInput) => { value.options[0]!.id = secret; },
+      (value: AssessmentInput) => { value.roles[0]!.name = secret; value.options[1]!.roles = [secret]; },
+      (value: AssessmentInput) => { value.noDelegationReason = { code: "handoff_not_worthwhile", detail: secret }; },
+    ]) {
+      const value = structuredClone(input); mutate(value);
+      let clientCalls = 0; let debugCalls = 0;
+      await assert.rejects(() => askJev(value, undefined,
+        () => { clientCalls++; return client(response("research")); }, async () => { debugCalls++; }));
+      assert.equal(clientCalls, 0, secret); assert.equal(debugCalls, 0, secret);
+    }
+  }
+});
+
+test("tool schema accepts compact direct and omitted roles but requires delegated safety fields", () => {
+  const minimal = { phase: "initial", phaseId: "phase-one", nextStep: input.nextStep, options: [{ id: "direct", kind: "direct", summary: direct.summary, evidence: direct.evidence, verificationCriteria: direct.verificationCriteria }],
+    noDelegationReason: { code: "trivial_continuation", detail: "A short local continuation only." } };
+  assert.equal(Value.Check(DELEGATION_ASSESS_PARAMS, minimal), true);
+  assert.equal(Value.Check(DELEGATION_ASSESS_PARAMS, { ...minimal, options: [minimal.options[0], { ...minimal.options[0], id: "delegate", kind: "delegated" }] }), false);
+  assert.equal(Value.Check(DELEGATION_ASSESS_PARAMS, { ...minimal, roles: [] }), true);
+});
+
+test("service state omits direct delegation boilerplate and keeps unknown comparison evidence", () => {
+  const state = normalizeAssessmentInput({ ...input, options: [{ id: "direct", kind: "direct", summary: direct.summary, evidence: direct.evidence, verificationCriteria: direct.verificationCriteria }, input.options[1]!] });
+  const request = buildChoiceRequest(state);
+  const directPayload = request.state.options[0]!;
+  assert.equal("roles" in directPayload, false);
+  assert.equal("required_tools" in directPayload, false);
+  assert.equal("handoff_effort" in directPayload, false);
+  assert.equal("authorized" in directPayload, false);
+  assert.equal(directPayload.execution_effort, "unknown");
+  assert.equal(request.state.options[1]!.handoff_effort, "low");
 });
 
 test("malformed distributions, unknown IDs, missing keys and cancellation are rejected", async () => {

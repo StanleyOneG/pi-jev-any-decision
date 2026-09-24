@@ -10,6 +10,22 @@ test("enforce and rules-only require freshness while observe never blocks", () =
   const observe = new Gate(); observe.newRequest("r"); assert.equal(observe.mayWork("observe", 1, 16_000).allowed, true);
 });
 
+test("new requests retain accepted advice and its original context baseline, but discard pending work", () => {
+  const gate = new Gate(); gate.newRequest("first");
+  const accepted = gate.beginAssessment("initial:a")!; gate.record(accepted, assessment("direct", "initial:a", 100));
+  gate.markDispatch("old"); gate.recordDeviation("Concrete reason", 100, 1000);
+  gate.newRequest("second");
+  assert.equal(gate.state.assessment?.contextTokens, 100);
+  assert.equal(gate.state.deviation, undefined);
+  assert.equal(gate.settleDispatch("old", true), "stale");
+  assert.equal(gate.assessmentNeed(1099, 1000), null);
+  assert.equal(gate.assessmentNeed(1100, 1000), "context_growth");
+  const pending = gate.beginAssessment("transition:b")!;
+  gate.newRequest("third");
+  assert.equal(gate.record(pending, assessment("direct", "transition:b")), false);
+  assert.equal(gate.assessmentNeed(100, 1000), "missing");
+});
+
 test("phase identities and generations discard concurrent stale results", () => {
   const gate = new Gate(); gate.newRequest("r");
   const first = gate.beginAssessment("initial:a")!;

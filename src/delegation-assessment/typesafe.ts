@@ -34,11 +34,15 @@ export function buildChoiceRequest(input: AssessmentInput, costs: RelativeCostCo
       })),
       options: admissible.map((option) => ({
         id: option.id, kind: option.kind, summary: option.summary, evidence: option.evidence, verification_criteria: option.verificationCriteria,
-        roles: option.roles, required_tools: option.requiredTools, task_suitability: option.taskSuitability,
-        context_dependency: option.contextDependency, decisions_recorded: option.decisionsRecorded, handoff_effort: option.handoffEffort,
-        handoff_loss_risk: option.handoffLossRisk, verification_effort: option.verificationEffort, execution_effort: option.executionEffort,
+        context_dependency: option.contextDependency, decisions_recorded: option.decisionsRecorded,
+        verification_effort: option.verificationEffort, execution_effort: option.executionEffort,
         rework_risk: option.reworkRisk, expected_benefit: option.expectedBenefit, independent_review_benefit: option.independentReviewBenefit,
+        ...(option.kind === "delegated" ? {
+          roles: option.roles, required_tools: option.requiredTools, task_suitability: option.taskSuitability,
+          handoff_effort: option.handoffEffort, handoff_loss_risk: option.handoffLossRisk,
+        } : {}),
       })),
+      ...(input.noDelegationReason ? { no_delegation_reason: { code: input.noDelegationReason.code, detail: input.noDelegationReason.detail } } : {}),
       context_tokens_approximate: input.contextTokens,
       parent_context: input.parentContext ? { context_window_tokens: input.parentContext.contextWindowTokens,
         smart_zone_tokens: input.parentContext.smartZoneTokens, remaining_tokens: input.parentContext.remainingTokens,

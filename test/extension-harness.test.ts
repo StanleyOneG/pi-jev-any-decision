@@ -9,9 +9,9 @@ import type { AssessmentInput, ModelJudgment } from "../src/delegation-assessmen
 async function harness(mode?: "observe" | "enforce" | "rules-only" | "off", trusted = true, extraConfig: Record<string, unknown> = {}) {
   const cwd = await mkdtemp(join(tmpdir(), "jev-extension-")); if (mode) { await mkdir(join(cwd, ".pi")); await writeFile(join(cwd, ".pi", "delegation-assessment.json"), JSON.stringify({ mode, provisionalConfidenceThreshold: .7, ...extraConfig })); }
   const handlers = new Map<string, Array<(event: any, ctx: any) => any>>(); const tools: any[] = []; const notices: string[] = []; const entries: any[] = []; let tokens: number | undefined = 10; let sessionId = "session-1"; let usageError = false;
-  const pi: any = { on(name: string, handler: any) { const list = handlers.get(name) ?? []; list.push(handler); handlers.set(name, list); return () => {}; }, registerTool(tool: any) { tools.push(tool); }, appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); }, events: { on() {}, emit() {} } };
+  const messages: Array<{ message: any; options: any }> = []; const pi: any = { sendMessage(message: any, options: any) { messages.push({ message, options }); }, on(name: string, handler: any) { const list = handlers.get(name) ?? []; list.push(handler); handlers.set(name, list); return () => {}; }, registerTool(tool: any) { tools.push(tool); }, appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); }, events: { on() {}, emit() {} } };
   const ctx: any = { cwd, mode: "json", hasUI: false, signal: undefined, isProjectTrusted: () => trusted, getContextUsage: () => { if (usageError) throw new Error("usage unavailable"); return tokens === undefined ? undefined : ({ tokens, contextWindow: 100_000, percent: .01 }); }, sessionManager: { getSessionId: () => sessionId, getEntries: () => entries }, ui: { setStatus: (_k: string, text: string) => notices.push(text), notify: (text: string) => notices.push(text) } };
-  return { pi, handlers, tools, ctx, notices, entries, setTokens: (value: number | undefined) => { tokens = value; }, setUsageError: (value: boolean) => { usageError = value; }, setSessionId: (value: string) => { sessionId = value; } };
+  return { pi, handlers, tools, ctx, notices, entries, messages, setTokens: (value: number | undefined) => { tokens = value; }, setUsageError: (value: boolean) => { usageError = value; }, setSessionId: (value: string) => { sessionId = value; } };
 }
 const input = (phaseId = "initial-1") => ({ phase: "initial" as const, phaseId, nextStep: "Research official documentation and return a concise bounded brief.", roles: [{ name: "researcher", summary: "Research official documentation.", purpose: "research" as const, available: true, suitable: true, authorized: true, tools: ["read"] }], options: [
   { id: "direct", kind: "direct" as const, summary: "Parent researches and verifies the documentation.", evidence: "Parent can perform the complete task.", verificationCriteria: "Cross-check the primary documentation.", roles: [], requiredTools: [], authorized: true, writeConflict: false, taskSuitability: "suitable" as const, contextDependency: "low" as const, decisionsRecorded: "documents" as const, handoffEffort: "low" as const, handoffLossRisk: "low" as const, verificationEffort: "moderate" as const, executionEffort: "high" as const, reworkRisk: "low" as const, expectedBenefit: "moderate" as const, independentReviewBenefit: "low" as const },
@@ -21,6 +21,127 @@ const direct: ModelJudgment = { choice: "direct", confidence: .9, probabilities:
 const research: ModelJudgment = { ...direct, choice: "research", probabilities: { research: .85, direct: .05, insufficient_information: .05, revise_options: .05 } };
 async function start(h: Awaited<ReturnType<typeof harness>>) { await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx); h.handlers.get("input")![0]({ source: "interactive", text: "raw secret user text" }, h.ctx); }
 function tool(h: Awaited<ReturnType<typeof harness>>, name: string) { return h.tools.find((candidate) => candidate.name === name)!; }
+
+const compact = () => ({ phase: "initial" as const, phaseId: "tiny", nextStep: "Continue a small checked change.", options: [{ id: "direct", kind: "direct" as const, summary: "Parent continues.", evidence: "No independent unit.", verificationCriteria: "Check result." }], noDelegationReason: { code: "trivial_continuation" as const, detail: "The continuation is too small for a useful handoff." } });
+
+test("accepted advice survives replies, retains original growth baseline and compact output", async () => {
+  const h = await harness("enforce"); let calls = 0;
+  createDelegationAssessment(async () => { calls++; return research; })(h.pi); await start(h);
+  const assess = tool(h, "delegation_assess");
+  const first = await assess.execute("a", input(), undefined, undefined, h.ctx);
+  assert.equal(calls, 1); assert.equal(first.details.serviceCalled, true);
+  const content = JSON.parse(first.content[0].text);
+  assert.equal(content.effective, "research"); assert.equal(content.probabilities, undefined);
+  assert.ok(first.details.probabilities);
+  h.setTokens(8_000); h.handlers.get("input")![0]({ source: "interactive", text: "continue" }, h.ctx);
+  assert.equal((await h.handlers.get("tool_call")![0]({ toolName: "read", toolCallId: "reuse", input: {} }, h.ctx))?.block, undefined);
+  assert.equal(calls, 1);
+  h.setTokens(16_010); h.handlers.get("input")![0]({ source: "interactive", text: "continue again" }, h.ctx);
+  assert.equal((await h.handlers.get("tool_call")![0]({ toolName: "read", toolCallId: "expired", input: {} }, h.ctx))?.block, true);
+  await assess.execute("b", { ...input("changed-work"), phase: "transition" }, undefined, undefined, h.ctx);
+  assert.equal(calls, 2);
+});
+
+test("direct-only normalization and cached roles avoid service; explicit replacement and clearing validate", async () => {
+  const h = await harness("observe"); let calls = 0;
+  createDelegationAssessment(async () => { calls++; return research; })(h.pi); await start(h);
+  const assessor = tool(h, "delegation_assess");
+  assert.equal(assessor.parameters.required.includes("roles"), false);
+  const [first, second] = await Promise.all([assessor.execute("a", compact(), undefined, undefined, h.ctx), assessor.execute("b", compact(), undefined, undefined, h.ctx)]);
+  assert.equal(calls, 0); assert.equal(first.details.reason, "no_comparison"); assert.equal(first.details.serviceCalled, false); assert.equal(second.details.effective, "direct");
+  assert.equal(first.details.confidence, null, "local result must not invent confidence");
+  await assessor.execute("roles", input(), undefined, undefined, h.ctx);
+  const omitted = { ...input("reuse-roles"), roles: undefined };
+  assert.equal((await assessor.execute("reuse", omitted, undefined, undefined, h.ctx)).details.effective, "research");
+  await assert.rejects(() => assessor.execute("clear", { ...omitted, roles: [] }, undefined, undefined, h.ctx), /missing role researcher/);
+  await assessor.execute("clear-direct", { ...compact(), roles: [] }, undefined, undefined, h.ctx);
+  await assert.rejects(() => assessor.execute("missing", omitted, undefined, undefined, h.ctx), /missing role researcher/);
+  assert.equal(calls, 2);
+});
+
+test("observe sends one model-visible growth reminder per accepted assessment without extra turn", async () => {
+  const h = await harness("observe"); createDelegationAssessment(async () => direct)(h.pi); await start(h);
+  const assess = tool(h, "delegation_assess"); await assess.execute("a", input(), undefined, undefined, h.ctx);
+  h.setTokens(16_010);
+  const work = () => h.handlers.get("tool_call")![0]({ toolName: "read", toolCallId: "read", input: {} }, h.ctx);
+  await work(); await work(); h.setTokens(33_000); await work();
+  assert.equal(h.messages.length, 1);
+  assert.equal(h.messages[0].message.display, false);
+  assert.equal(h.messages[0].options.triggerTurn, false);
+  assert.match(h.messages[0].message.content, /context_growth/);
+  h.handlers.get("input")![0]({ source: "interactive", text: "continue" }, h.ctx);
+  await work(); assert.equal(h.messages.length, 1);
+  await assess.execute("b", { ...input("growth"), phase: "context_growth" }, undefined, undefined, h.ctx);
+  h.setTokens(49_000); await work(); assert.equal(h.messages.length, 2);
+});
+
+test("stale explicit roles cannot replace accepted capabilities or advice", async () => {
+  const h = await harness("enforce"); const pending = new Map<string, (value: ModelJudgment) => void>();
+  createDelegationAssessment((value) => new Promise((resolve) => pending.set(value.phaseId, resolve)))(h.pi); await start(h);
+  const assessor = tool(h, "delegation_assess");
+  const stale = assessor.execute("stale", { ...input("old"), roles: [{ ...input().roles[0], name: "old_role" }], options: [input().options[0], { ...input().options[1], roles: ["old_role"] }] }, undefined, undefined, h.ctx);
+  h.handlers.get("input")![0]({ source: "interactive", text: "follow-up" }, h.ctx);
+  const fresh = assessor.execute("fresh", input("fresh"), undefined, undefined, h.ctx);
+  pending.get("fresh")!(research); await fresh;
+  pending.get("old")!(direct); assert.equal((await stale).details.stale, true);
+  const omitted = assessor.execute("reuse", { ...input("next"), roles: undefined }, undefined, undefined, h.ctx);
+  pending.get("next")!(research);
+  assert.equal((await omitted).details.effective, "research");
+  await assert.rejects(() => assessor.execute("bad", { ...input("bad"), roles: undefined, options: [input().options[0], { ...input().options[1], roles: ["old_role"] }] }, undefined, undefined, h.ctx), /missing role old_role/);
+});
+
+test("capability discovery, model change, compaction and tree invalidate retained advice and role evidence", async () => {
+  const h = await harness("enforce"); createDelegationAssessment(async () => research)(h.pi); await start(h);
+  const assessor = tool(h, "delegation_assess");
+  const work = () => h.handlers.get("tool_call")![0]({ toolName: "read", toolCallId: "work", input: {} }, h.ctx);
+  await assessor.execute("a", input(), undefined, undefined, h.ctx);
+  await h.handlers.get("tool_call")![0]({ toolName: "subagent", toolCallId: "list", input: { action: "list", capabilities: true } }, h.ctx);
+  await h.handlers.get("tool_result")![0]({ toolName: "subagent", toolCallId: "list", input: { action: "list", capabilities: true }, isError: false, details: {} }, h.ctx);
+  assert.equal((await work())?.block, true);
+  await assert.rejects(() => assessor.execute("missing", { ...input(), roles: undefined }, undefined, undefined, h.ctx), /missing role researcher/);
+  await assessor.execute("a", input(), undefined, undefined, h.ctx);
+  h.handlers.get("model_select")![0]({ previousModel: { provider: "one", id: "old" }, model: { provider: "two", id: "new" } }, h.ctx);
+  assert.equal((await work())?.block, true);
+  await assessor.execute("a", input(), undefined, undefined, h.ctx);
+  h.handlers.get("session_compact")![0]({}, h.ctx); assert.equal((await work())?.block, true);
+  await assessor.execute("a", input(), undefined, undefined, h.ctx);
+  h.handlers.get("session_tree")![0]({}, h.ctx); assert.equal((await work())?.block, true);
+});
+
+test("stale or failed role discovery does not erase a newer validated snapshot", async () => {
+  const h = await harness("enforce"); createDelegationAssessment(async () => research)(h.pi); await start(h);
+  const assessor = tool(h, "delegation_assess");
+  const list = (id: string) => h.handlers.get("tool_call")![0]({ toolName: "subagent", toolCallId: id, input: { action: "list", capabilities: true } }, h.ctx);
+  const result = (id: string, isError: boolean) => h.handlers.get("tool_result")![0]({ toolName: "subagent", toolCallId: id, input: { action: "list", capabilities: true }, isError, details: {} }, h.ctx);
+  await list("old");
+  h.handlers.get("input")![0]({ source: "interactive", text: "next request" }, h.ctx);
+  await assessor.execute("fresh", input(), undefined, undefined, h.ctx);
+  await result("old", false);
+  await list("failed"); await result("failed", true);
+  assert.equal((await assessor.execute("reuse", { ...input("reuse"), roles: undefined }, undefined, undefined, h.ctx)).details.effective, "research");
+});
+
+test("effective budget changes invalidate advice without resetting on ordinary token changes", async () => {
+  const h = await harness("enforce"); let window = 100_000;
+  h.ctx.getContextUsage = () => ({ tokens: 10, contextWindow: window });
+  createDelegationAssessment(async () => direct)(h.pi); await start(h);
+  await tool(h, "delegation_assess").execute("a", input(), undefined, undefined, h.ctx);
+  const work = () => h.handlers.get("tool_call")![0]({ toolName: "read", toolCallId: "work", input: {} }, h.ctx);
+  assert.equal((await work())?.block, undefined);
+  window = 90_000;
+  assert.equal((await work())?.block, true);
+});
+
+test("guidance is short on follow-up and fully restored after tree navigation", async () => {
+  const h = await harness("observe"); createDelegationAssessment(async () => direct)(h.pi); await start(h);
+  const guidance = () => h.handlers.get("before_agent_start")![0]({}, h.ctx).message.content as string;
+  assert.match(guidance(), /Discover roles once/);
+  assert.doesNotMatch(guidance(), /raw secret/);
+  h.handlers.get("input")![0]({ source: "interactive", text: "continue" }, h.ctx);
+  assert.match(guidance(), /Continue with the accepted|No accepted routing advice/);
+  h.handlers.get("session_tree")![0]({}, h.ctx);
+  assert.match(guidance(), /Discover roles once/);
+});
 
 test("debug is opt-in, project-local, records cache and separates sessions", async () => {
   const h = await harness("observe", true, { debug: true }); let calls = 0;
@@ -118,11 +239,11 @@ test("observe deduplicates missing and pending warnings but rearms on lifecycle 
   assert.equal(warnings().length, 3, "pending warning must not hide expiry in the same generation");
   assert.match(warnings().at(-1)!, /оценка устарела/);
   h.handlers.get("input")![0]({ source: "interactive", text: "next request" }, h.ctx);
-  await work(); await work(); assert.equal(warnings().length, 4);
+  await work(); await work(); assert.equal(warnings().length, 3, "ordinary replies retain the same expired assessment");
   h.handlers.get("session_tree")![0]({}, h.ctx);
-  await work(); await work(); assert.equal(warnings().length, 5);
+  await work(); await work(); assert.equal(warnings().length, 4);
   await start(h);
-  await work(); await work(); assert.equal(warnings().length, 6);
+  await work(); await work(); assert.equal(warnings().length, 5);
 });
 
 test("parent smart-zone telemetry warns at 80 percent and budget without forcing delegation or blocking", async () => {
@@ -339,7 +460,7 @@ test("late assessments cannot open a new request or phase and repeated state is 
   const second = tool(h, "delegation_assess").execute("b", input("second"), undefined, undefined, h.ctx);
   resolve(direct); await second; const stale = await first; assert.equal(stale.details.stale, true);
   h.handlers.get("input")![0]({ source: "interactive", text: "new request" }, h.ctx);
-  assert.equal((await h.handlers.get("tool_call")![0]({ toolName: "bash", toolCallId: "work", input: {} }, h.ctx))?.block, true);
+  assert.equal((await h.handlers.get("tool_call")![0]({ toolName: "bash", toolCallId: "work", input: {} }, h.ctx))?.block, undefined, "accepted advice survives the next request");
   assert.equal(calls, 2);
 });
 
@@ -362,11 +483,11 @@ test("extension input and trigger-only idle runs establish a fresh bounded reque
   await h.handlers.get("agent_start")![0]({}, h.ctx); // continuation does not reset the active request
   assert.equal((await h.handlers.get("tool_call")![0]({ toolName: "bash", toolCallId: "continuation", input: {} }, h.ctx))?.block, undefined);
   h.handlers.get("agent_settled")![0]({}, h.ctx);
-  await h.handlers.get("agent_start")![0]({}, h.ctx); // a later trigger-only run must not reuse the old permit
-  assert.equal((await h.handlers.get("tool_call")![0]({ toolName: "bash", toolCallId: "second", input: {} }, h.ctx))?.block, true);
+  await h.handlers.get("agent_start")![0]({}, h.ctx); // idle trigger starts a request but may reuse accepted advice
+  assert.equal((await h.handlers.get("tool_call")![0]({ toolName: "bash", toolCallId: "second", input: {} }, h.ctx))?.block, undefined);
   h.handlers.get("agent_settled")![0]({}, h.ctx);
   h.handlers.get("input")![0]({ source: "extension", text: "fresh extension message" }, h.ctx);
-  assert.equal((await h.handlers.get("tool_call")![0]({ toolName: "bash", toolCallId: "third", input: {} }, h.ctx))?.block, true);
+  assert.equal((await h.handlers.get("tool_call")![0]({ toolName: "bash", toolCallId: "third", input: {} }, h.ctx))?.block, undefined);
 });
 
 test("cancelled calls clean exact in-flight state and stale answers never cache or authorize", async () => {

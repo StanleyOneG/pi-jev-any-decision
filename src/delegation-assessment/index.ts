@@ -3,12 +3,12 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { StringEnum } from "@earendil-works/pi-ai";
+import { DELEGATION_ASSESS_PARAMS } from "./schema.ts";
 import { Gate } from "./gate.ts";
 import { DEFAULT_BUDGET_CONFIG, parentContext, validBudget, type BudgetConfig, type ParentContext } from "./context-budget.ts";
 import { askJev } from "./typesafe.ts";
 import { createDebugLog, type DebugSink } from "./debug.ts";
-import { DEFAULT_POLICY_CONFIG, applyPolicy, assessmentIdentity, isBoundedServiceAction, isWorkingTool, validateAssessmentInput, validateEnglishSafe, validateRelativeCosts, type Assessment, type AssessmentInput, type PolicyConfig, type RelativeCostConfig } from "./policy.ts";
+import { DEFAULT_POLICY_CONFIG, applyPolicy, assessmentIdentity, isBoundedServiceAction, isWorkingTool, noComparison, normalizeAssessmentInput, validateEnglishSafe, validateRelativeCosts, type Assessment, type AssessmentInput, type Role, type PolicyConfig, type RelativeCostConfig } from "./policy.ts";
 
 const CUSTOM_TYPE = "delegation-assessment";
 const MAX_CACHE = 20;
@@ -50,7 +50,11 @@ function currentSessionId(ctx: ExtensionContext): string | undefined {
   return typeof id === "string" && id ? id : undefined;
 }
 function render(assessment: Assessment) {
-  return { effective: assessment.effective, choice: assessment.choice, origin: assessment.origin, confidence: assessment.confidence, probabilities: assessment.probabilities, contextTokensApproximate: assessment.contextTokens, model: assessment.model, parentContext: assessment.parentContext, excluded: assessment.excluded, needsRevision: assessment.needsRevision, conservativeFallback: assessment.conservativeFallback };
+  return { effective: assessment.effective, choice: assessment.choice, origin: assessment.origin, reason: assessment.reason, confidence: assessment.confidence, probabilities: assessment.probabilities, contextTokensApproximate: assessment.contextTokens, model: assessment.model, parentContext: assessment.parentContext, excluded: assessment.excluded, needsRevision: assessment.needsRevision, conservativeFallback: assessment.conservativeFallback };
+}
+function conciseResult(assessment: Assessment, observation: boolean) {
+  const action = assessment.needsRevision ? `Revise the options or transfer evidence once; excluded: ${assessment.excluded.map((item) => `${item.optionId} (${item.reasons.join(", ")})`).join("; ").slice(0, 350) || "model requested clarification"}.` : undefined;
+  return { observation, effective: assessment.effective, origin: assessment.origin, reason: assessment.reason, ...(assessment.needsRevision ? { needsRevision: true, action } : {}), ...(assessment.conservativeFallback ? { conservativeFallback: true } : {}) };
 }
 /** Launch receipts are authoritative only when pi-subagents returns its top-level run identity. */
 function confirmedDispatch(details: unknown): boolean {
@@ -78,8 +82,13 @@ export function createDelegationAssessment(ask: (input: AssessmentInput, signal:
     let parentActionGeneration: number | undefined;
     let budgetWarningKey: string | undefined;
     let assessmentWarningKey: string | undefined;
+    let growthReminderKey: string | undefined;
+    let guidanceSent = false;
+    let cachedRoles: Role[] = [];
     const cache = new Map<string, Assessment>();
     const inFlight = new Map<string, Promise<Assessment>>();
+    const capabilityDiscovery = new Map<string, ReturnType<Gate["snapshot"]>>();
+    let latestDiscoveryId: string | undefined;
     // One runtime-owned clarification allowance per actual user request, independent of caller phase IDs.
     let revisionUsed = false;
     const failOpen = (ctx: ExtensionContext): void => {
@@ -106,6 +115,16 @@ export function createDelegationAssessment(ask: (input: AssessmentInput, signal:
       ui(ctx, () => ctx.ui.notify(text, "warning"));
     };
     const newRequest = (): void => { gate.newRequest(`r:${randomUUID()}`); cache.clear(); revisionUsed = false; };
+    const invalidateCapabilities = (): void => { cachedRoles = []; gate.invalidateAssessment(); cache.clear(); };
+    const invalidateForModel = (budget: ParentContext): void => {
+      const previous = gate.state.assessment?.parentContext;
+      if (previous && ((budget.model !== null && previous.model !== budget.model)
+        || (budget.contextWindowTokens !== null && previous.contextWindowTokens !== budget.contextWindowTokens)
+        || previous.configuredSmartZoneTokens !== budget.configuredSmartZoneTokens
+        || (previous.contextWindowTokens !== null && budget.contextWindowTokens !== null && previous.smartZoneTokens !== budget.smartZoneTokens))) {
+        gate.invalidateAssessment(); cache.clear();
+      }
+    };
     const displayResult = (ctx: ExtensionContext, assessment: Assessment, outcome: "result" | "discarded"): void => {
       const label = assessment.origin === "rules" ? "Оценка правил" : "Jev";
       if (outcome === "discarded") {
@@ -120,8 +139,8 @@ export function createDelegationAssessment(ask: (input: AssessmentInput, signal:
 
     pi.on("session_start", async (event, ctx) => {
       try {
-        gate.resetSession(); budgetWarningKey = undefined;
-        cache.clear(); inFlight.clear(); revisionUsed = false; runActive = false; requestPreparedForRun = false;
+        gate.resetSession(); budgetWarningKey = undefined; assessmentWarningKey = undefined; growthReminderKey = undefined; guidanceSent = false; cachedRoles = [];
+        cache.clear(); inFlight.clear(); capabilityDiscovery.clear(); latestDiscoveryId = undefined; revisionUsed = false; runActive = false; requestPreparedForRun = false;
         sessionId = currentSessionId(ctx);
         debugLog = undefined;
         const loaded = await loadConfig(ctx); config = loaded.config;
@@ -141,6 +160,10 @@ export function createDelegationAssessment(ask: (input: AssessmentInput, signal:
         if (loaded.warning) ui(ctx, () => ctx.ui.notify(loaded.warning!, "warning"));
       } catch { failOpen(ctx); }
     });
+    pi.on("session_compact", (_event, ctx) => guarded(ctx, () => { invalidateCapabilities(); guidanceSent = false; growthReminderKey = undefined; }));
+    pi.on("model_select", (event, ctx) => guarded(ctx, () => {
+      if (event.previousModel && `${event.previousModel.provider}/${event.previousModel.id}` !== `${event.model.provider}/${event.model.id}`) { gate.invalidateAssessment(); cache.clear(); }
+    }));
     // sendUserMessage emits source:"extension"; it is still a fresh user request.
     pi.on("input", (_event, ctx) => guarded(ctx, () => {
       if (config.enabled && !gate.state.disabled) { newRequest(); requestPreparedForRun = true; }
@@ -157,32 +180,32 @@ export function createDelegationAssessment(ask: (input: AssessmentInput, signal:
     }));
     pi.on("agent_settled", (_event, _ctx) => { runActive = false; });
     pi.on("session_tree", (_event, ctx) => guarded(ctx, () => {
-      gate.invalidateAssessment(); cache.clear();
+      invalidateCapabilities(); guidanceSent = false; growthReminderKey = undefined;
     }));
     pi.on("before_agent_start", (_event, ctx) => guarded(ctx, () => {
       if (!config.enabled || gate.state.disabled || !gate.state.requestId) return;
-      const modeText = config.mode === "observe" ? "Observe only; never block tools." : "Require a fresh assessment only; the recommendation does not force execution.";
-      return { message: { customType: CUSTOM_TYPE, display: false, content: `Dynamic routing assessment (${config.mode}). Before the first working tool and each explicit new phase, call delegation_assess with an English <=2000-character next-step summary, phase category, phaseId, compact roles from subagent action:list capabilities:true, and 1-8 bounded execution options including exactly one admissible direct baseline. Options may describe serial, parallel, mixed, partial, consultation or independent review work. Supply evidence and verification criteria, permissions, role tools, task suitability, context dependency, decisions recorded, handoff effort/loss, verification/execution effort, rework and benefits; mark unknown honestly. Never claim role costs in the tool call: project-configured relative costs are resolved locally, absent profiles are unknown. Unknown transfer safety for context-dependent work calls for at most one clarification per actual user request across all phase IDs/categories; then conservative direct fallback. If choosing differently from the current recommendation, record a concrete English reason with delegation_deviate; no launch is required. After approximately ${config.contextGrowthTokens} additional parent context tokens, including after reading large skills or reference documents, reassess with phase=context_growth before the next working tool, including subagent launches. Read only relevant reference sections. Parent smart-zone default budget is ${config.smartZoneTokens} tokens, capped at the model window. A large parent context alone does not justify delegation. At the budget, propose a manual handoff or compaction; do not launch children or compact automatically. Child context usage is unknown. Do not include raw user text, code, logs, or secrets. ${modeText} This tool only advises; the parent alone launches existing subagents and does not expand permissions.` } };
+      const budget = parentContext(ctx, config).budget;
+      invalidateForModel(budget);
+      const need = gate.assessmentNeed(contextTokens(ctx), config.contextGrowthTokens);
+      const first = !guidanceSent; guidanceSent = true;
+      const guidance = `Dynamic routing (${config.mode}): assess before the first working tool, meaningful new work phase, changed goal/scope/permissions/capabilities, or ${config.contextGrowthTokens} additional context tokens (phase=context_growth), including after reading large skills or reference documents, before the next working tool, including subagent launches. A phase is a meaningful work unit, not every reply or tool result. Discover roles once with subagent action:list capabilities:true and rediscover on capability change; omit roles to reuse the last validated snapshot, [] clears it. Submit bounded English nextStep, phaseId and one direct baseline with evidence and verificationCriteria; for direct-only include noDelegationReason. For substantial research/code discovery compare an authorized bounded delegated alternative when useful, or explain why none was offered. Delegated options need capability, tool, suitability, transfer and comparison evidence; unknown is not favorable. Reassess explicitly before materially different work: retained advice is not permission to launch or act. One clarification per request for unresolved transfer safety, then conservative direct fallback. Record concrete delegation_deviate if choosing differently. Never send raw user text, code, logs or secrets to Jev; no forced launch or permission expansion. Smart-zone budget ${config.smartZoneTokens} tokens is advisory: propose manual handoff/compaction, never automatic launch.`;
+      return { message: { customType: CUSTOM_TYPE, display: false, content: first ? guidance : need === "context_growth" ? "Routing advice expired by context growth. Reassess with phase=context_growth before working tools; no automatic delegation." : need === "missing" ? "No accepted routing advice. Assess before working tools; discover roles if capabilities are unknown." : need === "pending" ? "Routing assessment pending; wait for its accepted result before working tools." : "Continue with the accepted routing advice for this work phase. Reassess for a material transition, capability change, or growth; advice does not authorize launches." } };
     }));
 
-    pi.registerTool({ name: "delegation_assess", label: "Delegation Assess", description: "Compare bounded dynamic execution options; does not launch children. Old facts/selectedCandidate calls must migrate to options.", promptSnippet: "Assess dynamic options before working tools or a phase transition", promptGuidelines: ["Submit one direct baseline and up to seven other execution options, with compact roles from subagent action:list capabilities:true. Unknown facts are not favorable evidence."], parameters: Type.Object({
-      phase: StringEnum(["initial", "transition", "context_growth"] as const), phaseId: Type.String({ minLength: 1, maxLength: 80 }), nextStep: Type.String({ minLength: 1, maxLength: 2000 }),
-      roles: Type.Array(Type.Object({ name: Type.String({ maxLength: 80 }), summary: Type.String({ maxLength: 300 }), purpose: StringEnum(["execution", "research", "review"] as const), available: Type.Boolean(), suitable: Type.Boolean(), authorized: Type.Boolean(), tools: Type.Array(Type.String({ maxLength: 80 }), { maxItems: 16 }) }), { maxItems: 12 }),
-      options: Type.Array(Type.Object({ id: Type.String({ maxLength: 80 }), kind: StringEnum(["direct", "delegated"] as const), summary: Type.String({ maxLength: 500 }), evidence: Type.String({ maxLength: 400 }), verificationCriteria: Type.String({ maxLength: 400 }), roles: Type.Array(Type.String({ maxLength: 80 }), { maxItems: 12 }), requiredTools: Type.Array(Type.String({ maxLength: 80 }), { maxItems: 12 }), authorized: Type.Boolean(), writeConflict: Type.Boolean(), taskSuitability: StringEnum(["suitable", "unsuitable", "unknown"] as const), contextDependency: StringEnum(["low", "moderate", "high", "unknown"] as const), decisionsRecorded: StringEnum(["documents", "conversation", "both", "unknown"] as const), handoffEffort: StringEnum(["low", "moderate", "high", "unknown"] as const), handoffLossRisk: StringEnum(["low", "moderate", "high", "unknown"] as const), verificationEffort: StringEnum(["low", "moderate", "high", "unknown"] as const), executionEffort: StringEnum(["low", "moderate", "high", "unknown"] as const), reworkRisk: StringEnum(["low", "moderate", "high", "unknown"] as const), expectedBenefit: StringEnum(["low", "moderate", "high", "unknown"] as const), independentReviewBenefit: StringEnum(["low", "moderate", "high", "unknown"] as const) }), { minItems: 1, maxItems: 8 }),
-    }), async execute(_id, params, signal, _update, ctx) {
+    pi.registerTool({ name: "delegation_assess", label: "Delegation Assess", description: "Compare bounded dynamic execution options; does not launch children. Old facts/selectedCandidate calls must migrate to options.", promptSnippet: "Assess before working tools or a meaningful phase transition; omit roles to reuse validated capabilities", promptGuidelines: ["Submit one direct baseline and up to seven other execution options; for direct-only explain noDelegationReason. Unknown facts are not favorable evidence."], parameters: DELEGATION_ASSESS_PARAMS, async execute(_id, params, signal, _update, ctx) {
       if (!config.enabled) return { content: [{ type: "text", text: "Assessment is off/baseline." }], details: { mode: "off" } };
       if (gate.state.disabled) return { content: [{ type: "text", text: "Assessment extension is disabled for this session." }], details: { disabled: true } };
       let tokens: number | null;
       let budget: ParentContext;
-      try { ({ tokens, budget } = parentContext(ctx, config)); monitorBudget(ctx, budget); } catch { failOpen(ctx); return { content: [{ type: "text", text: "Assessment extension malfunctioned; gating is disabled for this session." }], details: { disabled: true } }; }
+      try { ({ tokens, budget } = parentContext(ctx, config)); monitorBudget(ctx, budget); invalidateForModel(budget); } catch { failOpen(ctx); return { content: [{ type: "text", text: "Assessment extension malfunctioned; gating is disabled for this session." }], details: { disabled: true } }; }
       if (gate.state.disabled) return { content: [{ type: "text", text: "Assessment extension is disabled for this session." }], details: { disabled: true } };
       const requestId = gate.state.requestId;
       if (!requestId) throw new Error("No active user request to assess.");
-      const input: AssessmentInput = { requestId, phase: params.phase, phaseId: params.phaseId, nextStep: params.nextStep, roles: params.roles, options: params.options, contextTokens: tokens, parentContext: budget };
-      // Host schema adapters can drop unknown keys; reject legacy shapes explicitly rather than inferring facts.
-      if ((params as Record<string, unknown>).facts !== undefined || (params as Record<string, unknown>).selectedCandidate !== undefined) throw new Error("Legacy facts/selectedCandidate input is unsupported; migrate to dynamic options.");
-      const invalid = validateAssessmentInput(input);
-      if (invalid) throw new Error(invalid); // caller input errors stay repairable
+      if (Object.hasOwn(params, "facts") || Object.hasOwn(params, "selectedCandidate")) throw new Error("Legacy facts/selectedCandidate input is unsupported; migrate to dynamic options.");
+      // Host-owned telemetry cannot be supplied by callers, even if a schema adapter passes it through.
+      if (["requestId", "contextTokens", "parentContext"].some((key) => Object.hasOwn(params, key))) throw new Error("requestId/context telemetry is host-provided; remove caller-supplied fields.");
+      // Validate every field visible to execute before touching identity, cache, or service.
+      const input = normalizeAssessmentInput({ ...params, requestId, contextTokens: tokens, parentContext: budget } as AssessmentInput, cachedRoles);
       try {
         const identity = assessmentIdentity(input, config.contextGrowthTokens, config.relativeCosts);
         const snapshot = gate.beginAssessment(identity);
@@ -190,7 +213,7 @@ export function createDelegationAssessment(ask: (input: AssessmentInput, signal:
         const log = debugLog;
         const debug: DebugSink | undefined = log ? (event) => log.write({ ...event, assessmentIdentity: identity, requestId, toolCallId: _id, phase: input.phase, phaseId: input.phaseId }) : undefined;
         let assessment = cache.get(identity);
-        const source = assessment ? "cache" : inFlight.has(identity) ? "in_flight" : config.mode === "rules-only" ? "rules" : "service";
+        const source = assessment ? "cache" : inFlight.has(identity) ? "in_flight" : config.mode === "rules-only" ? "rules" : noComparison(input) ? "local" : "service";
         // Queue without yielding: same-state calls must see inFlight registered below.
         const recorded = debug?.({ event: "assessment", source, input });
         if (!assessment) {
@@ -198,7 +221,7 @@ export function createDelegationAssessment(ask: (input: AssessmentInput, signal:
           if (!task) {
             task = (async () => {
               let judgment; let serviceFailed = false;
-              if (config.mode !== "rules-only") {
+              if (config.mode !== "rules-only" && !noComparison(input)) {
                 if (!ui(ctx, () => ctx.ui.notify("Jev: START; выполняется оценка.", "info"))) return applyPolicy(input, config, undefined, true, revisionUsed ? 1 : 0);
                 try { judgment = await ask(input, signal, debug, config.relativeCosts); }
                 catch (error) {
@@ -223,12 +246,13 @@ export function createDelegationAssessment(ask: (input: AssessmentInput, signal:
         else if (assessment.needsRevision && revisionUsed) assessment = { ...assessment, needsRevision: false, conservativeFallback: true };
         if (!gate.record(snapshot, assessment)) { await debug?.({ event: "discarded" }); displayResult(ctx, assessment, "discarded"); return { content: [{ type: "text", text: "Discarded stale assessment." }], details: { stale: true } }; }
         if (!accepted && assessment.needsRevision) revisionUsed = true;
+        if (params.roles !== undefined) cachedRoles = input.roles;
         cache.set(identity, assessment);
         if (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value as string);
         displayResult(ctx, assessment, "result");
         const result = render(assessment);
         await debug?.({ event: "result", source, result });
-        return { content: [{ type: "text", text: JSON.stringify({ observation: config.mode === "observe", ...result }) }], details: result };
+        return { content: [{ type: "text", text: JSON.stringify(conciseResult(assessment, config.mode === "observe")) }], details: { ...result, source, serviceCalled: source === "service" } };
       } catch (error) {
         if ((error as Error).message === "Assessment cancelled.") {
           ui(ctx, () => ctx.ui.notify("Jev: RESULT отменён.", "warning"));
@@ -254,23 +278,38 @@ export function createDelegationAssessment(ask: (input: AssessmentInput, signal:
 
     pi.on("tool_call", (event, ctx) => guarded(ctx, () => {
       if (!config.enabled || gate.state.disabled) return;
-      if (isBoundedServiceAction(event.toolName, event.input) || event.toolName === "delegation_deviate") return;
+      if (isBoundedServiceAction(event.toolName, event.input)) {
+        if (event.toolName === "subagent" && event.input.action === "list" && event.input.capabilities === true) {
+          capabilityDiscovery.set(event.toolCallId, gate.snapshot()); latestDiscoveryId = event.toolCallId;
+        }
+        return;
+      }
+      if (event.toolName === "delegation_deviate") return;
       const launch = event.toolName === "subagent";
       if (!isWorkingTool(event.toolName) && !launch) return;
       const { tokens, budget } = parentContext(ctx, config);
       monitorBudget(ctx, budget);
+      invalidateForModel(budget);
       if (gate.state.disabled) return;
       const verdict = gate.mayWork(config.mode, tokens, config.contextGrowthTokens);
       const need = gate.assessmentNeed(tokens, config.contextGrowthTokens);
       // Token counts and tool IDs change while the same assessment remains stale.
       // Generation changes on a new request, phase, session, or invalidation.
-      const warningKey = `${gate.state.generation}:${need}`;
+      const warningKey = need === "context_growth" ? `${gate.state.assessment?.identity}:${gate.state.assessment?.contextTokens}:growth` : `${gate.state.generation}:${need}`;
       if (config.mode === "observe" && need && assessmentWarningKey !== warningKey) {
         assessmentWarningKey = warningKey;
         const reason = need === "context_growth"
           ? `оценка устарела: рост контекста на ${tokens! - gate.state.assessment!.contextTokens!} токенов, порог ${config.contextGrowthTokens}; повторите delegation_assess с phase=context_growth и новым phaseId перед следующим рабочим инструментом`
           : need === "pending" ? "оценка ещё выполняется" : "оценка отсутствует для текущего запроса или фазы; вызовите delegation_assess";
         ui(ctx, () => ctx.ui.notify(`Наблюдение: ${reason}; инструмент не блокировался.`, "warning"));
+      }
+      if (config.mode === "observe" && need === "context_growth" && gate.state.assessment) {
+        const key = `${gate.state.assessment.identity}:${gate.state.assessment.contextTokens}`;
+        if (growthReminderKey !== key) {
+          growthReminderKey = key;
+          try { pi.sendMessage({ customType: CUSTOM_TYPE, display: false, content: "Routing advice expired by context growth. Reassess with delegation_assess phase=context_growth before the next working tool; no delegation is automatic." }, { deliverAs: "steer", triggerTurn: false }); }
+          catch { failOpen(ctx); }
+        }
       }
       if (!verdict.allowed && config.mode !== "observe") return { block: true, reason: verdict.reason };
       if (launch) { gate.markDispatch(event.toolCallId); ui(ctx, () => ctx.ui.notify("Действие главного агента: запуск делегирования (попытка).", "info")); }
@@ -284,7 +323,15 @@ export function createDelegationAssessment(ask: (input: AssessmentInput, signal:
       }
     }));
     pi.on("tool_result", (event, ctx) => guarded(ctx, () => {
-      if (!config.enabled || event.toolName !== "subagent" || isBoundedServiceAction(event.toolName, event.input)) return;
+      if (!config.enabled || event.toolName !== "subagent") return;
+      if (event.input && typeof event.input === "object" && !Array.isArray(event.input)
+        && event.input.action === "list" && event.input.capabilities === true) {
+        const snapshot = capabilityDiscovery.get(event.toolCallId);
+        capabilityDiscovery.delete(event.toolCallId);
+        if (!event.isError && snapshot && gate.isCurrent(snapshot) && latestDiscoveryId === event.toolCallId) invalidateCapabilities();
+        return;
+      }
+      if (isBoundedServiceAction(event.toolName, event.input)) return;
       const result = gate.settleDispatch(event.toolCallId, !event.isError && confirmedDispatch(event.details));
       if (result === "confirmed") ui(ctx, () => ctx.ui.notify("Действие главного агента: запуск делегирования подтверждён.", "info"));
       else if (result === "current-failed") ui(ctx, () => ctx.ui.notify("Действие главного агента: запуск не подтверждён; свежесть оценки не изменилась.", "warning"));
