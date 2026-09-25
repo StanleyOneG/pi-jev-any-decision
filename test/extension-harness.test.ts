@@ -135,12 +135,55 @@ test("effective budget changes invalidate advice without resetting on ordinary t
 test("guidance is short on follow-up and fully restored after tree navigation", async () => {
   const h = await harness("observe"); createDelegationAssessment(async () => direct)(h.pi); await start(h);
   const guidance = () => h.handlers.get("before_agent_start")![0]({}, h.ctx).message.content as string;
-  assert.match(guidance(), /Discover roles once/);
+  assert.match(guidance(), /Discover roles first/);
   assert.doesNotMatch(guidance(), /raw secret/);
   h.handlers.get("input")![0]({ source: "interactive", text: "continue" }, h.ctx);
   assert.match(guidance(), /Continue with the accepted|No accepted routing advice/);
   h.handlers.get("session_tree")![0]({}, h.ctx);
-  assert.match(guidance(), /Discover roles once/);
+  assert.match(guidance(), /Discover roles first/);
+});
+
+test("injected and registered guidance distinguish scoped permission, capability discovery and candidate omission", async () => {
+  const h = await harness("observe"); createDelegationAssessment(async () => direct)(h.pi); await start(h);
+  const injected = h.handlers.get("before_agent_start")![0]({}, h.ctx).message.content as string;
+  const assessor = tool(h, "delegation_assess");
+  const metadata = `${assessor.description} ${assessor.promptSnippet} ${assessor.promptGuidelines.join(" ")}`;
+  for (const text of [injected, metadata]) {
+    assert.match(text, /Discover roles first|Discover roles within host permissions/);
+    assert.match(text, /before (discovery|ruling out suitability)/);
+    assert.match(text, /current user, applicable project and loaded skill instructions/);
+    assert.match(text, /standing permission/);
+    assert.match(text, /discovery permission (does not grant|is not) writer permission/);
+    assert.match(text, /substantial implementation transitions/);
+    assert.match(text, /authorized suitable bounded implementation alternative|suitable, authorized bounded implementation alternative/);
+    assert.match(text, /small work or concrete blockers\/overhead/);
+    assert.match(text, /no_authorized_delegate/);
+    assert.match(text, /missing authority/);
+    assert.match(text, /[Oo]mission is not (Jev|model) rejection/);
+  }
+  assert.match(injected, /subagent action:list capabilities:true/);
+  assert.match(injected, /standing permission counts without fresh user wording/);
+  assert.match(injected, /no forced launch or permission expansion/);
+  assert.match(metadata, /standing permission needs no fresh user delegation words/);
+  assert.match(metadata, /does not discover roles, grant permission or launch children/);
+});
+
+test("small direct-only still skips Jev while a bounded implementation comparison calls it", async () => {
+  const h = await harness("observe"); let calls = 0;
+  createDelegationAssessment(async () => { calls++; return { ...research, choice: "implementation", probabilities: { direct: .05, implementation: .85, insufficient_information: .05, revise_options: .05 } }; })(h.pi); await start(h);
+  const assessor = tool(h, "delegation_assess");
+  const small = await assessor.execute("small", compact(), undefined, undefined, h.ctx);
+  assert.equal(small.details.reason, "no_comparison");
+  assert.equal(small.details.source, "local");
+  assert.equal(small.details.serviceCalled, false);
+  assert.equal(calls, 0);
+  const implementation = { ...input("implementation-transition"), phase: "transition", nextStep: "Implement the bounded module change and verify its tests.", roles: [{ ...input().roles[0], name: "implementer", purpose: "execution", summary: "Implement a bounded module change.", tools: ["read", "edit"] }], options: [input().options[0], { ...input().options[1], id: "implementation", summary: "Implementer changes the bounded module and reports verification.", roles: ["implementer"], requiredTools: ["read", "edit"] }] };
+  const compared = await assessor.execute("implementation", implementation, undefined, undefined, h.ctx);
+  assert.equal(compared.details.source, "service");
+  assert.equal(compared.details.effective, "implementation");
+  assert.notEqual(compared.details.reason, "no_comparison");
+  assert.equal(compared.details.serviceCalled, true);
+  assert.equal(calls, 1);
 });
 
 test("debug is opt-in, project-local, records cache and separates sessions", async () => {
